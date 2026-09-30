@@ -19,7 +19,6 @@ export function setToken(t) {
   TOKEN = t;
   try { localStorage.setItem('fastvol.token', t); } catch (e) { /* ignore */ }
 }
-export const VERSION = document.querySelector('meta[name="fastvol-version"]').content;
 
 export class ApiError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -55,13 +54,15 @@ export const store = {
   session: null,
   plugins: [],
   pluginMap: new Map(),
-  runs: new Map(),          // id -> summary
+  runs: new Map(),          // id -> summary of one plugin execution
+  batches: [],              // runs as the user sees them: several plugins started together
   procRun: null,            // run id of the process list
 };
 
-export function sessionRuns() {
+/** The open image's runs (batches), newest first. */
+export function sessionBatches() {
   const sid = store.session && store.session.id;
-  return [...store.runs.values()].filter(r => r.session === sid).sort((a, b) => b.id - a.id);
+  return store.batches.filter(b => b.session === sid).sort((a, b) => b.id - a.id);
 }
 
 export function pluginOs(name) {
@@ -109,7 +110,10 @@ export async function startEvents() {
 }
 
 function handleEvent(ev) {
-  if (ev.t === 'session') {
+  if (ev.t === 'batches') {
+    store.batches = ev.batches;
+    emit('batches', ev.batches);
+  } else if (ev.t === 'session') {
     const prev = store.session;
     store.session = ev.session;
     emit('session', { prev, cur: ev.session });
@@ -257,13 +261,6 @@ export function fmtTime(secs, withDate = true) {
   const iso = new Date(secs * 1000).toISOString();
   return withDate ? iso.slice(0, 19).replace('T', ' ') : iso.slice(11, 19);
 }
-export function fmtSpan(secs) {
-  secs = Math.abs(secs);
-  if (secs < 60) return `${Math.round(secs)}s`;
-  if (secs < 3600) return `${Math.round(secs / 60)}m`;
-  if (secs < 86400) return `${(secs / 3600).toFixed(1)}h`;
-  return `${(secs / 86400).toFixed(1)}d`;
-}
 
 // ------------------------------------------------------------------ python int(x, 0)
 /** Parse like python int(x, 0); returns a BigInt or null. */
@@ -315,14 +312,6 @@ export const prefs = {
   get(k, d) { try { const v = localStorage.getItem('fastvol.' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem('fastvol.' + k, JSON.stringify(v)); } catch (e) { /* quota / blocked */ } },
 };
-
-/** Remember plugin durations to show an ETA next time. */
-export function rememberDuration(plugin, ms) {
-  const d = prefs.get('durations', {});
-  d[plugin] = ms;
-  prefs.set('durations', d);
-}
-export function expectedDuration(plugin) { return prefs.get('durations', {})[plugin]; }
 
 // ------------------------------------------------------------------ menus
 let openMenu = null;

@@ -109,7 +109,7 @@ pub fn quote_path(p: &str) -> String {
     out
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SessionOpts {
     pub image: Option<PathBuf>,
     pub symbol_dirs: Vec<String>,
@@ -117,6 +117,13 @@ pub struct SessionOpts {
     pub offline: bool,
     pub remote_isf_url: Option<String>,
     pub cache_path: Option<String>,
+    /// `--clear-cache` (once, when this session opens)
+    pub clear_cache: bool,
+    /// `--single-location`: open this location instead of the image file
+    pub single_location: Option<String>,
+    pub stackers: Option<Vec<String>>,
+    pub swap_locations: Vec<String>,
+    pub verbosity: u8,
 }
 
 impl Session {
@@ -128,6 +135,10 @@ impl Session {
             cache_path: o.cache_path.clone(),
             output_dir: o.out_root.to_string_lossy().into_owned(),
             quiet: true,
+            clear_cache: o.clear_cache,
+            stackers: o.stackers.clone(),
+            swap_locations: o.swap_locations.clone(),
+            verbosity: o.verbosity,
             ..Default::default()
         };
         let mut size = 0;
@@ -136,6 +147,11 @@ impl Session {
             g.single_location = Some(format!("file://{}", quote_path(&s)));
             g.file = Some(s);
             size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        }
+        // --single-location wins over the file, as on the command line
+        if let Some(u) = o.single_location.as_ref().filter(|u| !u.is_empty()) {
+            g.file = u.strip_prefix("file://").map(|p| crate::util::paths::unquote(p));
+            g.single_location = Some(u.clone());
         }
         let ctx = Context::new(g)?;
         let warm = if o.image.is_some() { Warm::Running("Opening image") } else { Warm::Idle };

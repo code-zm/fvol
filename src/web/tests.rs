@@ -92,7 +92,7 @@ fn test_app() -> Arc<App> {
     // a small file stands in for the image: fake plugins never read it
     let img = out.with_extension("img");
     std::fs::write(&img, vec![0u8; 4096]).unwrap();
-    let opts = SessionOpts { image: Some(img), symbol_dirs: vec![], out_root: out, offline: true, remote_isf_url: None, cache_path: None };
+    let opts = SessionOpts { image: Some(img), symbol_dirs: vec![], out_root: out, offline: true, remote_isf_url: None, cache_path: None, ..Default::default() };
     let hub = Arc::new(Hub::default());
     let session = Arc::new(Session::new(1, &opts).unwrap());
     let plugins: Vec<&'static dyn Plugin> = vec![&FAKE, &SLOW, &CRASH];
@@ -111,6 +111,12 @@ fn test_app() -> Arc<App> {
         tickets: super::security::Tickets::default(),
         export_seq: std::sync::atomic::AtomicU64::new(1),
         started: std::time::Instant::now(),
+        options: std::sync::Mutex::new(Default::default()),
+        cli_options: Default::default(),
+        default_out: std::env::temp_dir(),
+        rules: std::sync::Mutex::new(None),
+        // no saved analysis: tests never write to the real ~/.fvol
+        analysis: std::sync::Mutex::new(None),
     })
 }
 
@@ -325,10 +331,10 @@ fn page_download_tickets_and_static_assets() {
     assert_eq!(call(&app, "GET", &url, &[HOST], "").0, 401); // used up
     assert_eq!(call(&app, "POST", "/api/ticket", &[HOST, AUTH], r#"{"path":"/etc/passwd"}"#).0, 422);
     // assets are public, ETag'd
-    let (st, _, r) = call(&app, "GET", "/assets/app.css", &[HOST], "");
+    let (st, _, r) = call(&app, "GET", "/assets/ui.css", &[HOST], "");
     assert_eq!(st, 200);
     let tag = r.headers.iter().find(|(n, _)| *n == "etag").unwrap().1.clone();
-    assert_eq!(call(&app, "GET", "/assets/app.css", &[HOST, ("if-none-match", &tag)], "").0, 304);
+    assert_eq!(call(&app, "GET", "/assets/ui.css", &[HOST, ("if-none-match", &tag)], "").0, 304);
     assert_eq!(call(&app, "GET", "/assets/../mod.rs", &[HOST], "").0, 404);
     assert_eq!(call(&app, "GET", "/assets/%2e%2e%2fmod.rs", &[HOST], "").0, 404);
     // a foreign Host can't even load the page

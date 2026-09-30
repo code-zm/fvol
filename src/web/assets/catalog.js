@@ -16,12 +16,6 @@ const CATS = [
   ['System info', /info|banners|frameworkinfo|isfinfo|crashinfo|statistics|layerwriter|configwriter|vmcoreinfo|boottime|lime/i],
 ];
 
-export function category(name) {
-  const n = name.toLowerCase();
-  for (const [c, re] of CATS) if (re.test(n)) return c;
-  return 'Other';
-}
-
 /** Short, analyst-oriented explanations (keyed by the name without OS prefix and class). */
 export const BLURBS = {
   'pslist': 'Active processes from the kernel\'s process list. The baseline for everything else.',
@@ -121,52 +115,6 @@ export function blurb(name) {
   return BLURBS[key] || BLURBS[noOs[noOs.length - 2]] || '';
 }
 
-/** Overview quick actions: [label, [candidate plugin names], key hint]. */
-export const QUICK = {
-  windows: [
-    ['Process tree', ['windows.pstree.PsTree', 'windows.pslist.PsList']],
-    ['Command lines', ['windows.cmdline.CmdLine']],
-    ['Network', ['windows.netscan.NetScan', 'windows.netstat.NetStat']],
-    ['Injected code', ['windows.malware.malfind.Malfind', 'windows.malfind.Malfind']],
-    ['Hidden processes', ['windows.malware.psxview.PsXView', 'windows.psxview.PsXView', 'windows.psscan.PsScan']],
-    ['Services', ['windows.svcscan.SvcScan', 'windows.svclist.SvcList']],
-    ['Loaded DLLs', ['windows.dlllist.DllList']],
-    ['Open files', ['windows.filescan.FileScan']],
-    ['Kernel drivers', ['windows.modules.Modules']],
-    ['Registry hives', ['windows.registry.hivelist.HiveList']],
-    ['Executed programs', ['windows.registry.userassist.UserAssist', 'windows.registry.amcache.Amcache', 'windows.shimcachemem.ShimcacheMem']],
-    ['Timeline', ['timeliner.Timeliner']],
-  ],
-  linux: [
-    ['Process tree', ['linux.pstree.PsTree', 'linux.pslist.PsList']],
-    ['Command lines', ['linux.psaux.PsAux']],
-    ['Network', ['linux.sockstat.Sockstat', 'linux.netstat.Netstat']],
-    ['Injected code', ['linux.malware.malfind.Malfind', 'linux.malfind.Malfind']],
-    ['Hidden processes', ['linux.psscan.PsScan', 'linux.pidhashtable.PIDHashTable']],
-    ['Shell history', ['linux.bash.Bash']],
-    ['Process spoofing', ['linux.malware.process_spoofing.ProcessSpoofing']],
-    ['Open files', ['linux.lsof.Lsof']],
-    ['Kernel modules', ['linux.lsmod.Lsmod']],
-    ['Hidden modules', ['linux.malware.hidden_modules.Hidden_modules', 'linux.hidden_modules.Hidden_modules']],
-    ['Syscall hooks', ['linux.malware.check_syscall.Check_syscall', 'linux.check_syscall.Check_syscall']],
-    ['Kernel log', ['linux.kmsg.Kmsg']],
-    ['Mounts', ['linux.mountinfo.MountInfo']],
-    ['Timeline', ['timeliner.Timeliner']],
-  ],
-  mac: [
-    ['Process tree', ['mac.pstree.PsTree', 'mac.pslist.PsList']],
-    ['Command lines', ['mac.psaux.Psaux']],
-    ['Network', ['mac.netstat.Netstat']],
-    ['Injected code', ['mac.malfind.Malfind']],
-    ['Shell history', ['mac.bash.Bash']],
-    ['Open files', ['mac.lsof.Lsof']],
-    ['Kernel extensions', ['mac.lsmod.Lsmod']],
-    ['Syscall hooks', ['mac.check_syscall.Check_syscall']],
-    ['Kernel log', ['mac.dmesg.Dmesg']],
-    ['Timeline', ['timeliner.Timeliner']],
-  ],
-};
-
 /** Process list per OS and how to read its columns. */
 export const PROCLIST = {
   windows: ['windows.pslist.PsList'],
@@ -185,48 +133,6 @@ export const PCOLS = {
   session: ['SessionId'],
   wow64: ['Wow64'],
   uid: ['UID'],
-};
-
-/** Per-process pivots: [label, [candidates], {pidCol}] — plugins with a pid option get
- * `--pid N`, the others run once and are filtered on their PID column. */
-export const PIVOTS = {
-  windows: [
-    ['Handles', ['windows.handles.Handles']],
-    ['DLLs', ['windows.dlllist.DllList']],
-    ['Memory regions', ['windows.vadinfo.VadInfo']],
-    ['Environment', ['windows.envars.Envars']],
-    ['Network', ['windows.netscan.NetScan', 'windows.netstat.NetStat']],
-    ['Threads', ['windows.threads.Threads']],
-    ['Injected code', ['windows.malware.malfind.Malfind', 'windows.malfind.Malfind']],
-    ['Unlinked DLLs', ['windows.malware.ldrmodules.LdrModules', 'windows.ldrmodules.LdrModules']],
-    ['SIDs', ['windows.getsids.GetSIDs']],
-    ['Privileges', ['windows.privileges.Privs']],
-    ['Sessions', ['windows.sessions.Sessions']],
-  ],
-  linux: [
-    ['Open files', ['linux.lsof.Lsof']],
-    ['Memory maps', ['linux.proc.Maps']],
-    ['Environment', ['linux.envars.Envars']],
-    ['Sockets', ['linux.sockstat.Sockstat']],
-    ['Injected code', ['linux.malware.malfind.Malfind', 'linux.malfind.Malfind']],
-    ['ELF files', ['linux.elfs.Elfs']],
-    ['Libraries', ['linux.library_list.LibraryList']],
-    ['Call stacks', ['linux.pscallstack.PsCallStack']],
-    ['Capabilities', ['linux.capabilities.Capabilities']],
-  ],
-  mac: [
-    ['Open files', ['mac.lsof.Lsof']],
-    ['Memory maps', ['mac.proc_maps.Maps']],
-    ['Injected code', ['mac.malfind.Malfind']],
-    ['Arguments', ['mac.psaux.Psaux']],
-  ],
-};
-
-/** Plugins that print a process's command line: [plugin, column]. */
-export const CMDLINE = {
-  windows: [['windows.cmdline.CmdLine', 'Args']],
-  linux: [['linux.psaux.PsAux', 'ARGS']],
-  mac: [['mac.psaux.Psaux', 'Arguments']],
 };
 
 /** Windows "find evil": expected parents and singleton processes. */

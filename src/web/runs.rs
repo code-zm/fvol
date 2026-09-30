@@ -84,6 +84,8 @@ pub struct RunData {
     pub truncated: bool,
     pub error: Option<ErrInfo>,
     pub started: Option<Instant>,
+    /// epoch ms when the plugin started (0 while queued)
+    pub started_ms: u64,
     pub elapsed_ms: u64,
     pub files: Vec<(String, u64)>,
     /// hub sequence of the last change
@@ -111,6 +113,12 @@ pub struct Run {
     /// cache key: plugin + canonical config
     pub key: String,
     pub origin: String,
+    /// the batch (a user's "run" of several plugins) this execution belongs to; 0 = none
+    pub batch: AtomicU64,
+    /// the options as the browser gave them (JSON), so a saved analysis can rebuild the run
+    pub req_args: Mutex<crate::cli::json::Json>,
+    /// the saved rows of a finished run (`~/.fvol/<dump_id>/...jsonl`), read back on first use
+    pub sidecar: Mutex<Option<PathBuf>>,
     pub created_ms: u64,
     pub out_dir: PathBuf,
     pub cancel: AtomicBool,
@@ -147,6 +155,7 @@ impl Run {
         }
         w.end_arr();
         w.ks("origin", &self.origin);
+        w.ku("batch", self.batch.load(Ordering::Relaxed));
         w.ks("status", d.status.as_str());
         w.kb("busy", d.busy);
         w.ku("rows", d.produced);
@@ -154,6 +163,7 @@ impl Run {
         w.kb("truncated", d.truncated);
         w.kb("evicted", d.evicted);
         w.ku("created", self.created_ms);
+        w.ku("started", d.started_ms);
         let el = match (d.status, d.started) {
             (Status::Running, Some(s)) => s.elapsed().as_millis() as u64,
             _ => d.elapsed_ms,
@@ -427,11 +437,58 @@ pub fn explain(e: &Error, run: &Run) -> ErrInfo {
 // ------------------------------------------------------------------------------------------
 // scheduler
 
+/// What a saved analysis records about one finished plugin execution.
+pub struct SavedRun {
+    pub status: Status,
+    pub rows: u64,
+    pub columns: Vec<Column>,
+    pub error: Option<ErrInfo>,
+    pub created_ms: u64,
+    pub started_ms: u64,
+    pub elapsed_ms: u64,
+    pub out_dir: PathBuf,
+    pub sidecar: Option<PathBuf>,
+}
+
+/// A batch: what the UI calls a "run", several plugins (each with its own options) started
+/// together. Each plugin is an ordinary [`Run`] (queued, streamed, cancellable) that carries the
+/// batch id; the batch only names and groups them.
+pub struct Batch {
+    pub id: u64,
+    pub session: u64,
+    pub name: Mutex<String>,
+    /// the results panel's "Filter rows" text for this run (kept so a saved analysis restores it)
+    pub filter: Mutex<String>,
+    pub created_ms: u64,
+    /// the plugin executions, in the order they were given
+    pub runs: Vec<u64>,
+}
+
+impl Batch {
+    pub fn json(&self, w: &mut W) {
+        w.obj().ku("id", self.id).ku("session", self.session).ks("name", &self.name.lock().unwrap_or_else(|e| e.into_inner()));
+        w.ks("filter", &self.filter.lock().unwrap_or_else(|e| e.into_inner()));
+        w.ku("created", self.created_ms).key("runs").arr();
+        for id in &self.runs {
+            w.u(*id);
+        }
+        w.end_arr().end_obj();
+    }
+}
+
 pub struct Runs {
     pub list: Mutex<Vec<Arc<Run>>>,
+    pub batches: Mutex<Vec<Arc<Batch>>>,
+    next_batch: AtomicU64,
     next_id: AtomicU64,
     sched: Mutex<(usize, VecDeque<Arc<Run>>)>,
+    /// plugins that may run at once (`--parallel`), and the limit in force (`--parallelism off` = 1)
     pub max_parallel: usize,
+    pub parallel: std::sync::atomic::AtomicUsize,
+    /// `-l`: a file that gets a line per run started, finished or failed
+    pub log: Mutex<Option<String>>,
+    /// `--write-config` / `--save-config`: the file each run's configuration is written to
+    pub config_name: Mutex<Option<String>>,
     pub hub: Arc<Hub>,
     /// table storage in use / allowed (bytes)
     pub used: Arc<AtomicU64>,
@@ -442,9 +499,14 @@ impl Runs {
     pub fn new(hub: Arc<Hub>, max_parallel: usize, budget: u64) -> Runs {
         Runs {
             list: Mutex::new(Vec::new()),
+            batches: Mutex::new(Vec::new()),
+            next_batch: AtomicU64::new(1),
             next_id: AtomicU64::new(1),
             sched: Mutex::new((0, VecDeque::new())),
             max_parallel: max_parallel.max(1),
+            parallel: std::sync::atomic::AtomicUsize::new(max_parallel.max(1)),
+            log: Mutex::new(None),
+            config_name: Mutex::new(None),
             hub,
             used: Arc::new(AtomicU64::new(0)),
             budget,
@@ -500,14 +562,24 @@ impl Runs {
     }
 
     pub fn create(self: &Arc<Self>, session: Arc<Session>, plugin: &'static dyn Plugin, cfg: Config, args: Vec<String>, key: String, origin: &str) -> Arc<Run> {
+        self.create_in(session, plugin, cfg, args, key, origin, None)
+    }
+
+    /// [`Runs::create`]; `keep` gives a restored run its original output folder and creation time.
+    #[allow(clippy::too_many_arguments)]
+    fn create_in(self: &Arc<Self>, session: Arc<Session>, plugin: &'static dyn Plugin, cfg: Config, args: Vec<String>, key: String, origin: &str, keep: Option<(PathBuf, u64)>) -> Arc<Run> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let short: String = plugin.name().chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '_' }).collect();
         // run ids restart with the server but output directories persist: never reuse one
         let mut out_dir = session.out_root.join(format!("run-{id:04}-{short}"));
         let mut k = 2;
-        while std::fs::symlink_metadata(&out_dir).is_ok() {
+        while keep.is_none() && std::fs::symlink_metadata(&out_dir).is_ok() {
             out_dir = session.out_root.join(format!("run-{id:04}-{short}-{k}"));
             k += 1;
+        }
+        let created_ms = keep.as_ref().map(|k| k.1).unwrap_or_else(now_ms);
+        if let Some((dir, _)) = keep {
+            out_dir = dir;
         }
         let run = Arc::new(Run {
             id,
@@ -521,7 +593,10 @@ impl Runs {
             args,
             key,
             origin: origin.to_string(),
-            created_ms: now_ms(),
+            batch: AtomicU64::new(0),
+            req_args: Mutex::new(crate::cli::json::Json::Null),
+            sidecar: Mutex::new(None),
+            created_ms,
             out_dir,
             cancel: AtomicBool::new(false),
             data: RwLock::new(RunData {
@@ -533,6 +608,7 @@ impl Runs {
                 truncated: false,
                 error: None,
                 started: None,
+                started_ms: 0,
                 elapsed_ms: 0,
                 files: Vec::new(),
                 seq: 0,
@@ -547,10 +623,57 @@ impl Runs {
         run
     }
 
+    pub fn batches(&self) -> Vec<Arc<Batch>> {
+        self.batches.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn batch(&self, id: u64) -> Option<Arc<Batch>> {
+        self.batches().into_iter().find(|b| b.id == id)
+    }
+
+    /// Group already created runs into a new batch, then queue them in order.
+    pub fn submit_batch(self: &Arc<Self>, session: u64, name: String, runs: Vec<Arc<Run>>) -> Arc<Batch> {
+        let id = self.next_batch.fetch_add(1, Ordering::Relaxed);
+        for r in &runs {
+            r.batch.store(id, Ordering::Relaxed);
+        }
+        let b = Arc::new(Batch { id, session, name: Mutex::new(name), filter: Mutex::new(String::new()), created_ms: now_ms(), runs: runs.iter().map(|r| r.id).collect() });
+        self.batches.lock().unwrap_or_else(|e| e.into_inner()).push(b.clone());
+        for r in runs {
+            self.submit(r);
+        }
+        self.hub.bump();
+        b
+    }
+
+    pub fn rename_batch(&self, b: &Batch, name: String) {
+        *b.name.lock().unwrap_or_else(|e| e.into_inner()) = name;
+        self.hub.bump();
+    }
+
+    pub fn set_batch_filter(&self, b: &Batch, q: String) {
+        *b.filter.lock().unwrap_or_else(|e| e.into_inner()) = q;
+        self.hub.bump();
+    }
+
+    /// Remove a batch and its plugin executions (cancelling any still going).
+    pub fn remove_batch(&self, id: u64) -> bool {
+        let Some(b) = self.batch(id) else { return false };
+        self.batches.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.id != id);
+        for r in &b.runs {
+            if let Some(run) = self.get(*r) {
+                self.cancel(&run);
+            }
+            self.remove(*r);
+        }
+        self.hub.bump();
+        true
+    }
+
     /// Queue a run; it starts as soon as a slot is free.
     pub fn submit(self: &Arc<Self>, run: Arc<Run>) {
         let mut s = self.sched.lock().unwrap_or_else(|e| e.into_inner());
-        if s.0 < self.max_parallel {
+        if s.0 < self.parallel.load(Ordering::Relaxed) {
             s.0 += 1;
             drop(s);
             self.spawn(run);
@@ -580,15 +703,109 @@ impl Runs {
 
     fn slot_done(self: &Arc<Self>) {
         let mut s = self.sched.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some(next) = s.1.pop_front() {
+        // (the limit may have dropped meanwhile: then this slot just closes)
+        if s.0 <= self.parallel.load(Ordering::Relaxed) {
+            while let Some(next) = s.1.pop_front() {
+                if next.cancel.load(Ordering::Relaxed) {
+                    continue;
+                }
+                drop(s);
+                self.spawn(next);
+                return;
+            }
+        }
+        s.0 -= 1;
+    }
+
+    /// A finished run from a saved analysis: its summary now, its rows from `sidecar` on first
+    /// use ([`Runs::load_saved`]). Never queued.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(self: &Arc<Self>, session: Arc<Session>, plugin: &'static dyn Plugin, cfg: Config, args: Vec<String>, key: String, req_args: crate::cli::json::Json, saved: SavedRun) -> Arc<Run> {
+        let run = self.create_in(session, plugin, cfg, args, key, "user", Some((saved.out_dir.clone(), saved.created_ms)));
+        *run.req_args.lock().unwrap_or_else(|e| e.into_inner()) = req_args;
+        *run.sidecar.lock().unwrap_or_else(|e| e.into_inner()) = saved.sidecar;
+        let mut d = run.write();
+        d.status = saved.status;
+        d.produced = saved.rows;
+        d.types = saved.columns.iter().map(|c| c.ty).collect();
+        d.table = Table::new(saved.columns.len());
+        d.columns = saved.columns;
+        d.error = saved.error;
+        d.started_ms = saved.started_ms;
+        d.elapsed_ms = saved.elapsed_ms;
+        d.files = list_files(&saved.out_dir);
+        d.seq = self.hub.bump();
+        drop(d);
+        run
+    }
+
+    /// Group restored runs into their saved batch (same id, name and filter).
+    pub fn restore_batch(&self, id: u64, session: u64, name: String, filter: String, created_ms: u64, runs: &[Arc<Run>]) {
+        for r in runs {
+            r.batch.store(id, Ordering::Relaxed);
+        }
+        let b = Arc::new(Batch { id, session, name: Mutex::new(name), filter: Mutex::new(filter), created_ms, runs: runs.iter().map(|r| r.id).collect() });
+        self.batches.lock().unwrap_or_else(|e| e.into_inner()).push(b);
+        self.next_batch.fetch_max(id + 1, Ordering::Relaxed);
+        self.hub.bump();
+    }
+
+    /// Read a finished run's saved rows back into memory (first view after reopening, or after
+    /// its table was dropped for memory). Within the memory budget, like a live run.
+    pub fn load_saved(&self, run: &Run) -> std::result::Result<(), String> {
+        {
+            let d = run.read();
+            if d.status != Status::Done || d.table.rows() > 0 || d.produced == 0 {
+                return Ok(());
+            }
+        }
+        let Some(path) = run.sidecar.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return Ok(()) };
+        let table = super::analysis::read_rows(&path, run.read().columns.len())?;
+        let add = table.bytes() as u64;
+        if self.used.load(Ordering::Relaxed) + add > self.budget {
+            self.evict(add, run.id);
+        }
+        let mut d = run.write();
+        if d.table.rows() > 0 {
+            return Ok(());
+        }
+        self.used.fetch_add(add, Ordering::Relaxed);
+        d.truncated = (table.rows() as u64) < d.produced;
+        d.table = table;
+        d.evicted = false;
+        d.seq = self.hub.bump();
+        drop(d);
+        run.views.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        Ok(())
+    }
+
+    /// Change how many plugins may run at once; queued runs start if the limit went up.
+    pub fn set_parallel(self: &Arc<Self>, n: usize) {
+        self.parallel.store(n.max(1), Ordering::Relaxed);
+        loop {
+            let mut s = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+            if s.0 >= n.max(1) {
+                return;
+            }
+            let Some(next) = s.1.pop_front() else { return };
             if next.cancel.load(Ordering::Relaxed) {
                 continue;
             }
+            s.0 += 1;
             drop(s);
             self.spawn(next);
-            return;
         }
-        s.0 -= 1;
+    }
+
+    /// `-l`: one line per run event, like the CLI's log file.
+    fn log(&self, line: &str) {
+        let Some(path) = self.log.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+        use std::io::Write;
+        // one line per event: option values cannot start another line
+        let line: String = line.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "fastvol.web INFO     {line}");
+        }
     }
 
     /// Cancel: queued runs never start; running ones stop at their next row (the UI shows the
@@ -635,8 +852,10 @@ impl Runs {
             d.status = Status::Running;
             d.busy = true;
             d.started = Some(Instant::now());
+            d.started_ms = now_ms();
             d.seq = self.hub.bump();
         }
+        self.log(&format!("run {} started: {} {}", run.id, run.plugin.name(), run.args.join(" ")));
         let t = Instant::now();
         let mut sink = WebSink {
             run,
@@ -700,6 +919,20 @@ impl Runs {
             }
         }
         d.seq = self.hub.bump();
+        let (status, rows) = (d.status, d.produced);
+        drop(d);
+        self.log(&format!("run {} {}: {} ({} rows)", run.id, status.as_str(), run.plugin.name(), rows));
+        // python writes the configuration once the automagics satisfied the plugin
+        if status == Status::Done
+            && let Some(name) = self.config_name.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            && let Ok(items) = crate::plugins::generic::pyconfig::plugin_configuration(&ctx, run.plugin.name(), &run.cfg, false)
+            && std::fs::create_dir_all(&run.out_dir).is_ok()
+        {
+            let _ = std::fs::write(run.out_dir.join(&name), format!("{}\n", crate::cli::json::Json::Obj(items).dump(Some(2))));
+            let mut d = run.write();
+            d.files = list_files(&run.out_dir);
+            d.seq = self.hub.bump();
+        }
     }
 }
 

@@ -26,6 +26,10 @@ case $cmd in
   start)
     port=$3; img=$4; shift 4
     stop
+    # a HOME of its own: test servers save their analyses there, never in the real ~/.fvol
+    # (the caches stay shared: XDG_CACHE_HOME points at the real ~/.cache)
+    mkdir -p "$dir/home"
+    XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}" HOME="$dir/home" \
     nohup "$ROOT/bench/scripts/limit.sh" -m 6G "$BIN" serve -f "$img" --port "$port" \
       --token "testtoken-$name-0123456789" -o "$dir/out" "$@" > "$dir/serve.log" 2>&1 &
     for _ in $(seq 1 6000); do   # limit.sh may wait for a free slot

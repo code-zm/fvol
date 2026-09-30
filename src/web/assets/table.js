@@ -5,6 +5,7 @@
 import { api, fetchRows, el, clear, copy, debounce, prefs, cellText, menu } from './core.js';
 
 const PAGE = 256;
+const LEVEL = 14;                   // px per tree level (indent guides)
 const MAX_PX = 15_000_000;          // stay well below browser element-height limits
 const NUMERIC = new Set(['Int', 'Float', 'Bin']);
 let uid = 0;
@@ -99,6 +100,9 @@ export class VirtualTable {
     this.hidden = new Set(cols.map((c, i) => (hid.includes(c.name) ? i : -1)).filter(i => i >= 0));
     if (this.hidden.size === cols.length) this.hidden.clear();
     this.savedWidths = (saved && saved.widths) || {};
+    const names = cols.map(c => c.name);
+    const known = ((saved && saved.order) || []).map(n => names.indexOf(n)).filter(i => i >= 0);
+    this.order = [...new Set([...known, ...cols.map((_, i) => i)])];
     this.widths = cols.map(c => this.savedWidths[c.name] || this.guessWidth(c, []));
     this.autosized = false;
     this.cur.col = this.visible()[0] || 0;
@@ -191,13 +195,31 @@ export class VirtualTable {
     return null;
   }
 
+  /** Tree guides of row `vi` at `depth`, one character per level 1..depth: "v" a line passing
+   * through (an ancestor has more children below), " " nothing, and for the row's own level
+   * "t" (├, more siblings follow) or "e" (└, the last child). Found by looking ahead through the
+   * loaded rows: a level continues when a later row returns to it before anything shallower. */
+  guides(vi, depth) {
+    const out = new Array(depth).fill('v');
+    let top = depth;                  // deepest level not decided yet
+    for (let k = vi + 1; top > 0 && k < this.total && k < vi + 4096; k++) {
+      const r = this.rowAt(k);
+      if (!r) break;                  // not loaded: assume the lines continue
+      const d = r[1] >> 2;
+      while (top >= 1 && top >= d) { out[top - 1] = top === d ? 'v' : ' '; top--; }
+    }
+    if (vi + 1 >= this.total) for (let l = top; l >= 1; l--) out[l - 1] = ' ';
+    out[depth - 1] = out[depth - 1] === 'v' ? 't' : 'e';
+    return out.join('');
+  }
+
   /** Row data at view index `i` (array [idx, flags, ...cells]) or undefined if not loaded. */
   rowAt(i) {
     const p = this.pages.get(Math.floor(i / PAGE));
     return p ? p[i % PAGE] : undefined;
   }
 
-  visible() { return this.cols.map((_, i) => i).filter(i => !this.hidden.has(i)); }
+  visible() { return (this.order || this.cols.map((_, i) => i)).filter(i => !this.hidden.has(i)); }
 
   // ------------------------------------------------------------------ layout
   charW() {
@@ -224,12 +246,22 @@ export class VirtualTable {
       }
       chars = Math.max(c.name.length + 3, Math.min(m + 1, c.type === 'Str' ? 64 : 40), 4);
     }
-    return Math.round(chars * cw + 18);
+    let extra = 0;
+    if (rows.length && i === 0) {
+      let d = 0;
+      for (const r of rows) d = Math.max(d, r[1] >> 2);
+      if (d) extra = d * LEVEL + 4;
+    }
+    return Math.round(chars * cw + 18 + extra);
   }
 
   autosize(rows) {
     this.autosized = true;
-    this.widths = this.cols.map((c, i) => this.savedWidths[c.name] || this.guessWidth(c, rows, i));
+    const first = 0;   // the tree column
+    // a remembered width never hides the tree: its column is at least as wide as the nesting needs
+    this.widths = this.cols.map((c, i) => i === first && rows.some(r => r[1] >> 2)
+      ? Math.max(this.savedWidths[c.name] || 0, this.guessWidth(c, rows, i))
+      : this.savedWidths[c.name] || this.guessWidth(c, rows, i));
     this.applyWidths();
   }
 
@@ -242,7 +274,7 @@ export class VirtualTable {
     const widths = {};
     this.cols.forEach((c, i) => { if (this.userSized && this.userSized.has(i)) widths[c.name] = this.widths[i]; });
     const prev = prefs.get('cols:' + this.o.plugin, {}) || {};
-    prefs.set('cols:' + this.o.plugin, { widths: { ...(prev.widths || {}), ...widths }, hidden: [...this.hidden].map(i => this.cols[i].name) });
+    prefs.set('cols:' + this.o.plugin, { widths: { ...(prev.widths || {}), ...widths }, hidden: [...this.hidden].map(i => this.cols[i].name), order: this.order.map(i => this.cols[i].name) });
   }
 
   buildHead() {
@@ -268,7 +300,8 @@ export class VirtualTable {
       grip.addEventListener('dblclick', e => { e.stopPropagation(); this.fitColumn(i); });
       grip.addEventListener('click', e => e.stopPropagation());
       cell.append(grip);
-      cell.addEventListener('click', e => this.toggleSort(i, e.shiftKey));
+      cell.addEventListener('mousedown', e => this.startMove(e, i, cell));
+      cell.addEventListener('click', e => { if (this.moved) { this.moved = false; return; } this.toggleSort(i, e.shiftKey); });
       cell.addEventListener('contextmenu', e => { e.preventDefault(); this.columnMenu(cell, i); });
       hrow.append(cell);
     }
@@ -376,13 +409,77 @@ export class VirtualTable {
     addEventListener('mouseup', up);
   }
 
+  /** Fit a column to its widest value among the loaded rows (and its header), measured with
+   * the fonts actually used; the tree column adds its indentation. */
   fitColumn(i) {
-    const rows = [];
-    for (let k = this.firstRow || 0; k < (this.firstRow || 0) + 200; k++) { const r = this.rowAt(k); if (r) rows.push(r); }
-    this.widths[i] = this.guessWidth(this.cols[i], rows, i);
+    const c = this.cols[i];
+    const ctx = (VirtualTable._fit ||= document.createElement('canvas').getContext('2d'));
+    const cellFont = getComputedStyle(this.root).font;
+    const hcell = this.head.querySelector(`.vt-hcell[data-col="${i}"]`);
+    ctx.font = hcell ? getComputedStyle(hcell).font : cellFont;
+    let w = ctx.measureText(c.name).width + (hcell ? 16 + (typeLabel(c.type) ? ctx.measureText(typeLabel(c.type)).width + 12 : 0) + (hcell.querySelector('.so') ? 18 : 0) : 16);
+    ctx.font = cellFont;
+    let depth = 0;
+    const start = Math.max(0, (this.firstRow || 0) - PAGE);
+    for (let k = start; k < Math.min(this.total, start + 3 * PAGE); k++) {
+      const r = this.rowAt(k);
+      if (!r) continue;
+      const v = r[i + 2];
+      const text = v === null ? '-' : v === 0 ? 'N/A' : String(v).split('\n')[0];
+      w = Math.max(w, ctx.measureText(text).width + 18);
+      if (i === 0) depth = Math.max(depth, r[1] >> 2);
+    }
+    this.widths[i] = Math.round(Math.min(900, Math.max(40, w + (depth ? depth * LEVEL + 4 : 0))));
     (this.userSized ||= new Set()).add(i);
     this.applyWidths();
     this.saveCols();
+  }
+
+  /** Drag a header sideways to move its column; a green line marks where it will land. */
+  startMove(e, i, cell) {
+    if (e.button !== 0 || e.target.classList.contains('grip')) return;
+    const x0 = e.clientX;
+    let marker = null, target = null;
+    const cells = () => [...this.head.querySelectorAll('.vt-hrow .vt-hcell')];
+    const move = ev => {
+      if (!marker && Math.abs(ev.clientX - x0) < 6) return;
+      if (!marker) {
+        marker = el('div.vt-drop');
+        this.head.append(marker);
+        cell.classList.add('moving');
+        document.body.classList.add('col-moving');
+      }
+      // the gap nearest the pointer: before cell k, or after the last one
+      const cs = cells();
+      const hr = this.head.getBoundingClientRect();
+      let k = cs.length;
+      for (let j = 0; j < cs.length; j++) { const r = cs[j].getBoundingClientRect(); if (ev.clientX < r.left + r.width / 2) { k = j; break; } }
+      target = k;
+      const edge = k < cs.length ? cs[k].getBoundingClientRect().left : cs[cs.length - 1].getBoundingClientRect().right;
+      marker.style.left = (edge - hr.left - 1) + 'px';
+    };
+    const up = () => {
+      removeEventListener('mousemove', move);
+      removeEventListener('mouseup', up);
+      if (!marker) return;
+      marker.remove();
+      cell.classList.remove('moving');
+      document.body.classList.remove('col-moving');
+      this.moved = true;   // swallow the click that follows, so the drop does not also sort
+      setTimeout(() => { this.moved = false; }, 0);
+      const vis = this.visible();
+      const before = target < vis.length ? vis[target] : null;
+      if (before === i) return;
+      const order = this.order.filter(x => x !== i);
+      const at = before === null ? order.length : order.indexOf(before);
+      order.splice(at, 0, i);
+      if (order.join() === this.order.join()) return;
+      this.order = order;
+      this.buildHead();
+      this.saveCols();
+    };
+    addEventListener('mousemove', move);
+    addEventListener('mouseup', up);
   }
 
   async copyColumn(i) {
@@ -471,7 +568,7 @@ export class VirtualTable {
       for (let j = 0; j < vis.length; j++) {
         const ci = vis[j];
         const cell = rowEl._cells[j];
-        this.fillCell(cell, ci, row[ci + 2], j === 0 ? depth : -1);
+        this.fillCell(cell, ci, row[ci + 2], ci === 0 ? depth : -1, ci === 0 && depth > 0 ? this.guides(vi, depth) : '');
         if (isCur && ci === this.cur.col) { cell.classList.add('cc'); active = cell; }
       }
     }
@@ -480,22 +577,32 @@ export class VirtualTable {
     this.renderEmpty();
   }
 
-  fillCell(cell, ci, v, depth) {
+  fillCell(cell, ci, v, depth, guides = '') {
     const c = this.cols[ci];
     const key = v === null ? '\u0000n' : v === 0 ? '\u0000a' : v;
-    if (cell._v === key && cell._ci === ci && cell._d === depth) {
+    if (cell._v === key && cell._ci === ci && cell._d === depth && cell._g === guides) {
       return;
     }
-    cell._v = key; cell._ci = ci; cell._d = depth;
+    cell._v = key; cell._ci = ci; cell._d = depth; cell._g = guides;
     let cls = 'vt-cell';
-    if (depth >= 0) { cls += ' t0'; cell.style.setProperty('--d', depth); if (depth > 0) cls += ' tree'; }
+    const tree = depth >= 0;
+    if (tree) { cls += ' t0'; cell.style.paddingLeft = depth > 0 ? `${8 + depth * LEVEL + 4}px` : ''; }
+    else cell.style.paddingLeft = '';
+    // the tree column is left-aligned so a value sits right after its connector
+    const finish = () => {
+      if (!guides) return;
+      const g = el('span.tg', { 'aria-hidden': 'true' });
+      for (const ch of guides) g.append(el('i', { class: ch === 'v' ? 'v' : ch === 't' ? 't' : ch === 'e' ? 'e' : '' }));
+      cell.prepend(g);
+    };
     if (v === null || v === 0) {
       cell.className = cls + ' ab';
       cell.textContent = v === null ? '-' : 'N/A';
+      finish();
       return;
     }
     const t = c.type;
-    if (NUMERIC.has(t)) cls += ' num';
+    if (NUMERIC.has(t) && !tree) cls += ' num';
     if (t === 'Hex') cls += ' hex link';
     if (t === 'Int' && /^(PID|PPID|Pid|PPid|Process ID)$/.test(c.name) && this.o.onPid) cls += ' pidlink';
     cell.className = cls;
@@ -505,14 +612,17 @@ export class VirtualTable {
       const firstLine = lines.find(l => l.trim()) || '';
       clear(cell);
       cell.append(firstLine, el('span.ml', { text: `${lines.length} lines` }));
+      finish();
       return;
     }
     if (t === 'DateTime' && v.length > 19) {
       clear(cell);
       cell.append(v.slice(0, 19), el('span.dim', { text: v.slice(19) }));
+      finish();
       return;
     }
     cell.textContent = v;
+    finish();
   }
 
   renderEmpty() {
