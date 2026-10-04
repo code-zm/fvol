@@ -117,7 +117,7 @@ fvol serve [-h] [-f FILE] [--host HOST] [--port PORT] [-s SYMBOL_DIRS] [-o OUTPU
 | `--host HOST`            | `127.0.0.1`          | IP address to listen on. `localhost` means `127.0.0.1`.                  |
 | `--port PORT`            | 8765                 | Port. Without the option, the first free port from 8765 to 8784 is used, then any free port. `0` means any free port. |
 | `-s, --symbol-dirs DIRS` | none                 | Semicolon-separated symbol directories, as for `fvol`. Like `--offline`, `-u` and `--cache-path`, it wins over the options saved with an analysis. |
-| `-o, --output-dir DIR`   | `./vol-serve-output` | Root of the per-run output directories.                                  |
+| `-o, --output-dir DIR`   | `./vol-serve-output` | Root of the per-run output directories. Given, it wins over an output folder saved with an analysis. |
 | `--offline`              | off                  | Never download symbols.                                                  |
 | `-u, --remote-isf-url URL` | none               | Remote symbol file list, as for `fvol`.                                   |
 | `--cache-path PATH`      | python's default     | python volatility3 cache path, as for `fvol`.                             |
@@ -155,7 +155,10 @@ saved with the analysis.
 
 `dump_id` is the key fastvol's cache (`~/.cache/fastvol`) uses for an image: a hash of its
 canonical path, size and modification time. A moved or changed dump is therefore a new
-analysis; **Previous** marks the old one *missing* or *changed*. The dump itself is never
+analysis; **Previous** marks the old one *missing* or *changed*. A metadata file this fastvol
+cannot read (damaged, or written by another version) is listed as *unreadable* and left as it is:
+the dump opens without its analysis, and nothing is saved over the file until it is deleted.
+Opening another dump saves the current one and closes its runs. The dump itself is never
 copied. **Delete** next to an analysis in **Previous** removes its metadata and result rows (for
 the dump that is open, its runs too). Results that did not fit the memory budget (`--max-memory`) are not saved; their run
 lists them, and running the plugin again gets them back.
@@ -246,7 +249,7 @@ The API exists for the UI and for scripts. Every call under `/api/` needs the to
 | `GET /api/runs/<ID>/rows`            | A page of rows: `from`, `count` up to 5000, optional `view`        |
 | `GET /api/runs/<ID>/stream`          | Every row as NDJSON while the plugin produces it                   |
 | `GET /api/runs/<ID>/export`          | The rows as `format=csv`, `tsv`, `json`, `jsonl` or `md`           |
-| `GET /api/runs/<ID>/vol`             | The plugin's `fvol` output; `renderer=<NAME>`, else the one in Options |
+| `GET /api/runs/<ID>/vol`             | The plugin's `fvol` output; `renderer=<NAME>`, else the one in Options, else `quick`, as `fvol` |
 | `GET /api/runs/<ID>/files`           | Files the plugin wrote                                             |
 | `GET /api/runs/<ID>/files/<NAME>`    | Download one file                                                  |
 | `GET /api/runs/<ID>/files.zip`       | Download all files as a zip                                        |
@@ -311,7 +314,7 @@ only by the person who started it.
 - **Cross-site requests.** Requests marked by the browser as cross-site, or with a foreign
   `Origin`, are refused. The server sends no CORS headers, and pages are served with a strict
   Content Security Policy, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`.
-- **No external content.** The UI's HTML, JavaScript, CSS and font are compiled into the binary.
+- **No external content.** The UI's HTML, JavaScript and CSS are compiled into the binary.
   The page loads nothing from other hosts.
 - **Request limits.** Request heads are limited to 16 KiB and 64 headers, bodies to 1 MiB and JSON
   nesting to 32 levels. A request must arrive within 10 seconds, idle connections close after 30

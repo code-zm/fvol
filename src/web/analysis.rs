@@ -42,13 +42,26 @@ fn valid_id(id: &str) -> bool {
     id.len() == 16 && id.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Write `data` to `path` through a temporary file, readable by the user only.
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+/// Write `path` through a temporary file, readable by the user only; `fill` writes the content
+/// (buffered, so a large table is never copied whole into memory).
+fn write_private(path: &Path, fill: impl FnOnce(&mut dyn Write) -> std::io::Result<()>) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().ok_or_else(|| std::io::Error::other("no parent"))?;
     super::presets::ensure_private_dir(dir)?;
     let tmp = dir.join(format!(".{}.tmp-{}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), std::process::id()));
-    let r = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).and_then(|mut f| f.write_all(data)).and_then(|_| std::fs::rename(&tmp, path));
+    let r = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|f| {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+            fill(&mut w)?;
+            w.into_inner().map_err(|e| e.into_error())?;
+            Ok(())
+        })
+        .and_then(|_| std::fs::rename(&tmp, path));
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -78,34 +91,38 @@ pub fn coltype_from(name: &str) -> ColType {
 /// A run's rows as JSON lines: a header, then `[depth, "kinds", cell, ...]` per row, `kinds`
 /// holding each cell's kind (text, absent, N/A, decimal, hex) so the table comes back exactly.
 pub fn write_rows(path: &Path, plugin: &str, columns: &[Column], t: &Table) -> std::io::Result<()> {
-    let mut out = Vec::with_capacity(t.text.len() + t.rows() * 16 + 256);
-    let mut h = W::new();
-    h.obj().ks("fastvol_results", "1").ks("plugin", plugin).key("columns").arr();
-    for c in columns {
-        h.obj().ks("name", &c.name).ks("type", super::runs::coltype_name(c.ty)).end_obj();
-    }
-    h.end_arr().end_obj();
-    out.extend_from_slice(&h.done());
-    out.push(b'\n');
-    for r in 0..t.rows() {
-        out.push(b'[');
-        out.extend_from_slice(t.depth[r].to_string().as_bytes());
-        out.extend_from_slice(b",\"");
-        for c in 0..t.ncols {
-            out.push(b'0' + t.kind(r, c));
+    write_private(path, |out| {
+        let mut h = W::new();
+        h.obj().ks("fastvol_results", "1").ks("plugin", plugin).key("columns").arr();
+        for c in columns {
+            h.obj().ks("name", &c.name).ks("type", super::runs::coltype_name(c.ty)).end_obj();
         }
-        out.push(b'"');
-        for c in 0..t.ncols {
-            out.push(b',');
-            match t.kind(r, c) {
-                K_DEC | K_HEX => out.extend_from_slice(t.value(r, c).unwrap_or(0).to_string().as_bytes()),
-                K_TEXT => jsonw::bytes_str(&mut out, t.cell(r, c)),
-                _ => out.extend_from_slice(b"null"),
+        h.end_arr().end_obj();
+        out.write_all(&h.done())?;
+        out.write_all(b"\n")?;
+        let mut line = Vec::with_capacity(256);
+        for r in 0..t.rows() {
+            line.clear();
+            line.push(b'[');
+            line.extend_from_slice(t.depth[r].to_string().as_bytes());
+            line.extend_from_slice(b",\"");
+            for c in 0..t.ncols {
+                line.push(b'0' + t.kind(r, c));
             }
+            line.push(b'"');
+            for c in 0..t.ncols {
+                line.push(b',');
+                match t.kind(r, c) {
+                    K_DEC | K_HEX => line.extend_from_slice(t.value(r, c).unwrap_or(0).to_string().as_bytes()),
+                    K_TEXT => jsonw::bytes_str(&mut line, t.cell(r, c)),
+                    _ => line.extend_from_slice(b"null"),
+                }
+            }
+            line.extend_from_slice(b"]\n");
+            out.write_all(&line)?;
         }
-        out.extend_from_slice(b"]\n");
-    }
-    write_private(path, &out)
+        Ok(())
+    })
 }
 
 /// Read rows written by [`write_rows`] into a table of `ncols` columns.
@@ -147,6 +164,8 @@ pub fn read_rows(path: &Path, ncols: usize) -> Result<Table, String> {
 /// The analysis of the open dump.
 pub struct Analysis {
     pub id: String,
+    /// the session showing this dump: its runs are the ones saved (set when the image opens)
+    pub session: u64,
     pub image: PathBuf,
     pub size: u64,
     pub mtime: i128,
@@ -160,18 +179,30 @@ pub struct Analysis {
 impl Analysis {
     pub fn new(image: &Path) -> Option<Analysis> {
         let (id, canon, size, mtime) = dump_id(image)?;
-        Some(Analysis { id, image: canon, size, mtime, created_ms: super::runs::now_ms(), saved_rows: HashSet::new(), last: Vec::new() })
+        Some(Analysis { id, session: 0, image: canon, size, mtime, created_ms: super::runs::now_ms(), saved_rows: HashSet::new(), last: Vec::new() })
     }
 }
 
-/// The saved metadata of a dump, if there is any.
-pub fn load(id: &str) -> Option<Json> {
+/// The saved metadata of a dump: `None` when there is none, an error when there is a file this
+/// build cannot read (too large, damaged, another format). Such a file is never written over.
+pub fn load(id: &str) -> Result<Option<Json>, String> {
     let p = metadata_path(id);
-    if std::fs::metadata(&p).ok()?.len() > MAX_META {
-        return None;
+    let bad = |why: String| format!("{}: {why}", p.display());
+    let m = match std::fs::metadata(&p) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(bad(e.to_string())),
+    };
+    if m.len() > MAX_META {
+        return Err(bad(format!("larger than {} MiB", MAX_META >> 20)));
     }
-    let j = json::parse(&std::fs::read_to_string(p).ok()?).ok()?;
-    matches!(j.get("fastvol_analysis"), Some(Json::Int(FORMAT))).then_some(j)
+    let text = std::fs::read_to_string(&p).map_err(|e| bad(e.to_string()))?;
+    let j = json::parse(&text).map_err(|e| bad(format!("damaged ({})", e.0)))?;
+    match j.get("fastvol_analysis") {
+        Some(Json::Int(FORMAT)) => Ok(Some(j)),
+        Some(Json::Int(n)) => Err(bad(format!("format {n}, this fastvol reads format {FORMAT}"))),
+        _ => Err(bad("not a fastvol analysis".into())),
+    }
 }
 
 fn sidecar_path(id: &str, batch: u64, n: usize) -> PathBuf {
@@ -195,10 +226,15 @@ fn write_error(w: &mut W, e: &Option<ErrInfo>) {
 
 /// Save the open analysis: rows of newly finished plugins, then the metadata when it changed.
 pub fn save(app: &super::App) {
-    let session = app.session();
     let mut guard = app.analysis.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(a) = guard.as_mut() else { return };
-    let batches: Vec<_> = app.runs.batches().into_iter().filter(|b| b.session == session.id).collect();
+    if let Some(a) = guard.as_mut() {
+        save_in(app, a);
+    }
+}
+
+/// [`save`] with the analysis lock held by the caller.
+pub fn save_in(app: &super::App, a: &mut Analysis) {
+    let batches: Vec<_> = app.runs.batches().into_iter().filter(|b| b.session == a.session).collect();
     let mut w = W::new();
     w.obj().ki("fastvol_analysis", FORMAT).ks("dump_id", &a.id).ks("image", &a.image.to_string_lossy());
     w.ks("name", &a.image.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
@@ -251,7 +287,7 @@ pub fn save(app: &super::App) {
     w.end_arr().end_obj();
     let mut data = w.done();
     data.push(b'\n');
-    if data != a.last && write_private(&metadata_path(&a.id), &data).is_ok() {
+    if data != a.last && write_private(&metadata_path(&a.id), |w| w.write_all(&data)).is_ok() {
         a.last = data;
     }
     // results of runs that were removed
@@ -282,15 +318,14 @@ fn save_rows(a: &mut Analysis, run: &Run, path: &Path) {
     }
 }
 
-/// Bring back the runs of a saved analysis into `session`.
-pub fn restore(app: &super::App, session: &std::sync::Arc<super::session::Session>, meta: &Json) {
+/// Bring back the runs of a saved analysis into `session` (`a` is its analysis, locked by the
+/// caller).
+pub fn restore(app: &super::App, session: &std::sync::Arc<super::session::Session>, meta: &Json, a: &mut Analysis) {
     let text = |j: &Json, k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let num = |j: &Json, k: &str| match j.get(k) {
         Some(Json::Int(i)) if *i >= 0 => *i as u64,
         _ => 0,
     };
-    let mut guard = app.analysis.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(a) = guard.as_mut() else { return };
     a.created_ms = num(meta, "created").max(1);
     for b in meta.get("runs").map(|r| r.as_arr()).unwrap_or(&[]) {
         let mut runs = Vec::new();
@@ -354,17 +389,28 @@ pub fn delete_in(root: &Path, id: &str) -> Result<(), String> {
 /// Every saved analysis, newest first: for the Quick Start's "Previous" list.
 pub fn list(w: &mut W) {
     let mut items: Vec<(u64, Json)> = Vec::new();
+    // files that cannot be read: listed (so they can be deleted), never opened
+    let mut unreadable: Vec<(u64, String, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(super::presets::fvol_dir()) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(id) = name.strip_suffix("-metadata.json").filter(|i| valid_id(i)) else { continue };
-            let Some(j) = load(id) else { continue };
             let updated = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or(0);
-            items.push((updated, j));
+            match load(id) {
+                Ok(Some(j)) => items.push((updated, j)),
+                Ok(None) => {}
+                Err(x) => unreadable.push((updated, id.to_string(), x)),
+            }
         }
     }
     items.sort_by(|a, b| b.0.cmp(&a.0));
+    unreadable.sort_by(|a, b| b.0.cmp(&a.0));
     w.arr();
+    for (updated, id, error) in &unreadable {
+        let path = metadata_path(id).to_string_lossy().into_owned();
+        w.obj().ks("dump_id", id).ks("image", &path).ks("name", &format!("{id}-metadata.json")).ks("state", "unreadable").ks("error", error);
+        w.ku("size", 0).ku("updated", *updated).ku("runs", 0).ku("plugins", 0).end_obj();
+    }
     for (updated, j) in &items {
         let text = |k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
         let image = text("image");

@@ -99,9 +99,12 @@ function badge(r) {
   return el('span', { class: 'rs-badge ' + r.status, text: r.status });
 }
 
-function renderTabs() {
+/** The tab bar; `scroll` brings the chosen tab into view (not on the progress ticks). */
+function renderTabs(scroll = true) {
   const b = batch();
   const bar = $('rs-tabs');
+  // rebuilt on every progress tick while plugins run: keyboard focus stays on its tab
+  const focused = bar.contains(document.activeElement) ? document.activeElement.dataset.run : null;
   clear(bar);
   for (const id of b.runs) {
     const r = store.runs.get(id);
@@ -114,8 +117,9 @@ function renderTabs() {
       badge(r));
     bar.append(tab);
   }
+  if (focused) { const f = bar.querySelector(`[data-run="${focused}"]`); if (f) f.focus({ preventScroll: true }); }
   const cur = bar.querySelector('[aria-selected="true"]');
-  if (cur) cur.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  if (scroll && cur) cur.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
 
 function selectTab(id, focusTable = false) {
@@ -211,7 +215,7 @@ export function wireResults() {
     if (!b || !changed) return;
     const mine = changed.filter(r => b.runs.includes(r.id));
     if (!mine.length) return;
-    renderTabs();
+    renderTabs(false);
     renderHead();
     if (!rv.timer && mine.some(r => ACTIVE(r.status))) rv.timer = setInterval(renderHead, 1000);
     for (const r of mine) {

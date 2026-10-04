@@ -602,3 +602,211 @@ fn landing_facts_are_unique() {
     assert_eq!(labels, ["Kernel", "Kernel Base", "DTB", "Symbols"]);
     assert_eq!(f[2].1, "0x1aa000");
 }
+
+// ------------------------------------------------------------------------------------------
+// runs of several plugins, saved analyses, options, presets, rules
+// (`presets::fvol_dir()` is a folder of the test process's own: nothing touches the real ~/.fvol)
+
+fn num(j: &Json, k: &str) -> u64 {
+    match j.get(k) {
+        Some(Json::Int(i)) => *i as u64,
+        _ => panic!("no number {k:?} in {}", j.dump(None)),
+    }
+}
+
+/// A file next to the test image that stands in for another dump.
+fn other_image(app: &Arc<App>, ext: &str) -> std::path::PathBuf {
+    let p = app.session().image.clone().unwrap().with_extension(ext);
+    std::fs::write(&p, vec![0u8; 4096]).unwrap();
+    p
+}
+
+/// Start a run of the fake plugin and wait for it; returns the batch id.
+fn finished_batch(app: &Arc<App>, name: &str) -> u64 {
+    let body = format!(r#"{{"name":"{name}","entries":[{{"plugin":"test.fake.Fake"}}]}}"#);
+    let (st, text, _) = call(app, "POST", "/api/batches", &[HOST, AUTH], &body);
+    assert_eq!(st, 200, "{text}");
+    let id = num(&j(&text), "id");
+    wait_done(app, app.runs.batch(id).unwrap().runs[0]);
+    id
+}
+
+#[test]
+fn batch_routes() {
+    let app = test_app();
+    let post = |path: &str, body: &str| call(&app, "POST", path, &[HOST, AUTH], body);
+    assert_eq!(post("/api/batches", r#"{"entries":[]}"#).0, 422);
+    assert_eq!(post("/api/batches", r#"{"entries":[{"plugin":"test.nope.Nope"}]}"#).0, 404);
+    // one bad option starts nothing
+    let (st, text, _) = post("/api/batches", r#"{"entries":[{"plugin":"test.fake.Fake"},{"plugin":"test.fake.Fake","args":{"mode":"warp"}}]}"#);
+    assert_eq!(st, 422, "{text}");
+    assert!(app.runs.batches().is_empty() && app.runs.all().is_empty());
+    // two plugins, each with its own options, in the order given; the default name counts runs
+    let (st, text, _) = post("/api/batches", r#"{"entries":[{"plugin":"test.fake.Fake","args":{"count":3}},{"plugin":"test.slow.Slow"}]}"#);
+    assert_eq!(st, 200, "{text}");
+    let b = j(&text);
+    assert_eq!(b.get("name").and_then(|n| n.as_str()), Some("Run 1"));
+    let id = num(&b, "id");
+    let runs: Vec<u64> = app.runs.batch(id).unwrap().runs.clone();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(app.runs.get(runs[0]).unwrap().plugin.name(), "test.fake.Fake");
+    wait_done(&app, runs[0]);
+    assert_eq!(app.runs.get(runs[0]).unwrap().read().produced, 3);
+    // rename and filter
+    assert_eq!(post(&format!("/api/batches/{id}/name"), r#"{"name":"  "}"#).0, 422);
+    let (st, text, _) = post(&format!("/api/batches/{id}/name"), r#"{"name":"Sweep"}"#);
+    assert_eq!((st, j(&text).get("name").and_then(|n| n.as_str())), (200, Some("Sweep")));
+    assert_eq!(post(&format!("/api/batches/{id}/filter"), r#"{"q":"svchost"}"#).0, 200);
+    assert_eq!(*app.runs.batch(id).unwrap().filter.lock().unwrap(), "svchost");
+    assert_eq!(post(&format!("/api/batches/{id}/filter"), &format!(r#"{{"q":"{}"}}"#, "x".repeat(1001))).0, 422);
+    // cancel stops the slow plugin; delete removes the run and its plugins
+    assert_eq!(post(&format!("/api/batches/{id}/cancel"), "").0, 200);
+    wait_done(&app, runs[1]);
+    assert_eq!(app.runs.get(runs[1]).unwrap().read().status, Status::Cancelled);
+    assert_eq!(call(&app, "DELETE", &format!("/api/batches/{id}"), &[HOST, AUTH], "").0, 200);
+    assert!(app.runs.batch(id).is_none() && runs.iter().all(|r| app.runs.get(*r).is_none()));
+    assert_eq!(post("/api/batches/999/name", r#"{"name":"x"}"#).0, 404);
+}
+
+#[test]
+fn saved_analysis_comes_back() {
+    let app = test_app();
+    let (a, b) = (other_image(&app, "keepA"), other_image(&app, "keepB"));
+    app.open(a.clone()).unwrap();
+    let id = finished_batch(&app, "First look");
+    assert_eq!(call(&app, "POST", &format!("/api/batches/{id}/filter"), &[HOST, AUTH], r#"{"q":"proc3"}"#).0, 200);
+    let dump = app.analysis.lock().unwrap().as_ref().unwrap().id.clone();
+    app.open(b).unwrap(); // saves A: metadata and the plugin's rows
+    assert!(app.runs.batches().iter().all(|x| x.session == app.session().id), "the runs of the image left behind stay");
+    app.open(a).unwrap();
+    let cur = app.session().id;
+    let back = app.runs.batches();
+    assert_eq!(back.len(), 1);
+    assert_eq!((back[0].id, back[0].session, back[0].name.lock().unwrap().clone(), back[0].filter.lock().unwrap().clone()), (id, cur, "First look".to_string(), "proc3".to_string()));
+    // the rows come back from the saved file on first use, without running the plugin again
+    let rid = back[0].runs[0];
+    assert_eq!(app.runs.get(rid).unwrap().read().table.rows(), 0);
+    let (st, text, _) = call(&app, "GET", &format!("/api/runs/{rid}/rows?from=0&count=20"), &[HOST, AUTH], "");
+    assert_eq!(st, 200, "{text}");
+    assert_eq!(num(&j(&text), "total"), 10);
+    // a new run after the restored one gets the next id
+    assert!(finished_batch(&app, "Second") > id);
+    assert!(app.delete_analysis(&dump).is_ok());
+    assert!(app.runs.batches().is_empty());
+}
+
+#[test]
+fn switching_images_keeps_run_ids_unique() {
+    let app = test_app();
+    let (a, b) = (other_image(&app, "dupA"), other_image(&app, "dupB"));
+    app.open(a.clone()).unwrap();
+    finished_batch(&app, "A run");
+    app.open(b.clone()).unwrap();
+    finished_batch(&app, "B run");
+    // A comes back with its saved run id while B's run of the same id was open
+    app.open(a).unwrap();
+    let ids: Vec<u64> = app.runs.batches().iter().map(|x| x.id).collect();
+    let mut uniq = ids.clone();
+    uniq.dedup();
+    assert_eq!(ids, uniq, "a run id is used twice");
+    let mine = app.runs.batches()[0].id;
+    assert_eq!(call(&app, "POST", &format!("/api/batches/{mine}/name"), &[HOST, AUTH], r#"{"name":"renamed"}"#).0, 200);
+    let cur = app.session().id;
+    assert_eq!(app.runs.batches().iter().find(|x| x.session == cur).map(|x| x.name.lock().unwrap().clone()).as_deref(), Some("renamed"));
+    let open = app.analysis.lock().unwrap().as_ref().unwrap().id.clone();
+    for dump in [open, super::analysis::dump_id(&b).unwrap().0] {
+        let _ = app.delete_analysis(&dump);
+    }
+}
+
+#[test]
+fn unreadable_analysis_is_left_alone() {
+    let app = test_app();
+    let (img, other) = (other_image(&app, "wipeA"), other_image(&app, "wipeB"));
+    app.open(img.clone()).unwrap();
+    finished_batch(&app, "A run");
+    let id = app.analysis.lock().unwrap().as_ref().unwrap().id.clone();
+    app.open(other.clone()).unwrap();
+    let meta = super::analysis::metadata_path(&id);
+    let rows = super::presets::fvol_dir().join(&id);
+    let saved_dirs = std::fs::read_dir(&rows).unwrap().count();
+    assert!(saved_dirs > 0);
+    // written by another version: this build must not read it, nor save over it
+    let text = std::fs::read_to_string(&meta).unwrap();
+    let newer = text.replacen("\"fastvol_analysis\":1", "\"fastvol_analysis\":2", 1);
+    assert_ne!(text, newer);
+    std::fs::write(&meta, &newer).unwrap();
+    app.open(img.clone()).unwrap();
+    finished_batch(&app, "not saved");
+    super::analysis::save(&app);
+    assert_eq!(std::fs::read_to_string(&meta).unwrap(), newer);
+    assert_eq!(std::fs::read_dir(&rows).unwrap().count(), saved_dirs);
+    let (_, text, _) = call(&app, "GET", "/api/session", &[HOST, AUTH], "");
+    assert!(j(&text).get("notice").and_then(|n| n.as_str()).is_some_and(|n| n.contains("format 2")), "{text}");
+    let (_, text, _) = call(&app, "GET", "/api/analyses", &[HOST, AUTH], "");
+    let listed = j(&text);
+    let item = listed.as_arr().iter().find(|x| x.get("dump_id").and_then(|d| d.as_str()) == Some(&*id)).cloned().unwrap();
+    assert_eq!(item.get("state").and_then(|s| s.as_str()), Some("unreadable"));
+    // deleting it from Previous: this dump is saved again, with the run made meanwhile
+    assert_eq!(call(&app, "DELETE", &format!("/api/analyses/{id}"), &[HOST, AUTH], "").0, 200);
+    let (_, text, _) = call(&app, "GET", "/api/session", &[HOST, AUTH], "");
+    assert!(matches!(j(&text).get("notice"), Some(Json::Null)), "{text}");
+    super::analysis::save(&app);
+    let saved = super::analysis::load(&id).unwrap().unwrap();
+    assert_eq!(saved.get("runs").map(|r| r.as_arr().len()), Some(1));
+    let _ = app.delete_analysis(&id);
+    let _ = app.delete_analysis(&super::analysis::dump_id(&other).unwrap().0);
+}
+
+#[test]
+fn options_route() {
+    let app = test_app();
+    let post = |body: &str| call(&app, "POST", "/api/options", &[HOST, AUTH], body);
+    assert_eq!(post(r#"{"parallelism":"lots"}"#).0, 422);
+    assert_eq!(post(r#"{"save_config":"../x.json"}"#).0, 422);
+    assert_eq!(post(r#"{"log":"/tmp/not-a-log"}"#).0, 422);
+    let log = std::env::temp_dir().join(format!("fastvol-web-test-{}-{}.log", std::process::id(), runs::now_ms()));
+    let (st, text, _) = post(&format!(r#"{{"log":"{}","parallelism":"off","write_config":true}}"#, log.display()));
+    assert_eq!(st, 200, "{text}");
+    assert_eq!(app.runs.parallel.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let (_, text, _) = call(&app, "GET", "/api/options", &[HOST, AUTH], "");
+    assert_eq!(j(&text).get("parallelism").and_then(|p| p.as_str()), Some("off"));
+    // -l: a line when the plugin starts and one when it ends
+    let id = start(&app, r#"{"plugin":"test.fake.Fake","args":{"count":2}}"#);
+    wait_done(&app, id);
+    let lines = std::fs::read_to_string(&log).unwrap();
+    assert!(lines.contains(&format!("run {id} started: test.fake.Fake")) && lines.contains(&format!("run {id} done: test.fake.Fake (2 rows)")), "{lines}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn preset_routes() {
+    let app = test_app();
+    let name = format!("Sweep {}", runs::now_ms());
+    let body = format!(r#"{{"name":"{name}","os":"windows","plugins":[{{"plugin":"test.fake.Fake","args":{{"count":3}}}}]}}"#);
+    let (st, text, _) = call(&app, "POST", "/api/presets", &[HOST, AUTH], &body);
+    assert_eq!(st, 200, "{text}");
+    let id = j(&text).get("id").and_then(|i| i.as_str()).unwrap().to_string();
+    assert_eq!(call(&app, "POST", "/api/presets", &[HOST, AUTH], &body).0, 409);
+    assert_eq!(call(&app, "POST", "/api/presets", &[HOST, AUTH], &body.replacen('{', r#"{"overwrite":true,"#, 1)).0, 200);
+    assert_eq!(call(&app, "POST", "/api/presets", &[HOST, AUTH], r#"{"name":"x","plugins":[{"plugin":"test.nope.Nope"}]}"#).0, 422);
+    let (_, text, _) = call(&app, "GET", "/api/presets", &[HOST, AUTH], "");
+    assert!(j(&text).get("presets").unwrap().as_arr().iter().any(|p| p.get("id").and_then(|i| i.as_str()) == Some(&*id)));
+    assert_eq!(call(&app, "DELETE", &format!("/api/presets/{id}"), &[HOST, AUTH], "").0, 200);
+    assert_eq!(call(&app, "DELETE", &format!("/api/presets/{id}"), &[HOST, AUTH], "").0, 404);
+    assert_eq!(call(&app, "DELETE", "/api/presets/..%2Fx", &[HOST, AUTH], "").0, 404);
+}
+
+#[test]
+fn rules_and_analyses_routes() {
+    let app = test_app();
+    assert_eq!(call(&app, "POST", "/api/rules", &[HOST, AUTH], r#"{"file":"r.json","text":"{nope"}"#).0, 422);
+    assert_eq!(call(&app, "POST", "/api/rules", &[HOST, AUTH], r#"{"file":"r.json","text":"{\"rules\":[]}"}"#).0, 200);
+    let (_, text, _) = call(&app, "GET", "/api/rules", &[HOST, AUTH], "");
+    assert_eq!(j(&text).get("file").and_then(|f| f.as_str()), Some("r.json"));
+    assert_eq!(call(&app, "DELETE", "/api/rules", &[HOST, AUTH], "").0, 200);
+    assert_eq!(call(&app, "GET", "/api/rules", &[HOST, AUTH], "").1, "null");
+    assert_eq!(call(&app, "DELETE", "/api/analyses/not-an-id", &[HOST, AUTH], "").0, 404);
+    assert_eq!(call(&app, "DELETE", "/api/analyses/0123456789abcdef", &[HOST, AUTH], "").0, 404);
+    assert_eq!(call(&app, "GET", "/api/analyses", &[HOST, AUTH], "").0, 200);
+}

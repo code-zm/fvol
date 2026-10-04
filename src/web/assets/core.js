@@ -262,31 +262,6 @@ export function fmtTime(secs, withDate = true) {
   return withDate ? iso.slice(0, 19).replace('T', ' ') : iso.slice(11, 19);
 }
 
-// ------------------------------------------------------------------ python int(x, 0)
-/** Parse like python int(x, 0); returns a BigInt or null. */
-export function int0(s) {
-  if (typeof s === 'number') return Number.isInteger(s) ? BigInt(s) : null;
-  let t = String(s).trim();
-  let neg = false;
-  if (t[0] === '-' || t[0] === '+') { neg = t[0] === '-'; t = t.slice(1); }
-  if (!t) return null;
-  let radix = 10, digits = t, prefixed = false;
-  if (/^0[xob]/i.test(t)) { radix = { x: 16, o: 8, b: 2 }[t[1].toLowerCase()]; digits = t.slice(2); prefixed = true; }
-  if (!digits) return null;
-  // underscores: single, between digits (one allowed right after a base prefix)
-  if (/__/.test(digits) || digits.endsWith('_') || (!prefixed && digits.startsWith('_'))) return null;
-  const clean = digits.replace(/_/g, '');
-  if (!clean) return null;
-  const re = { 2: /^[01]+$/, 8: /^[0-7]+$/, 10: /^[0-9]+$/, 16: /^[0-9a-f]+$/i }[radix];
-  if (!re.test(clean)) return null;
-  // decimal: no leading zeros except zero itself
-  if (radix === 10 && clean.length > 1 && clean[0] === '0' && /[1-9]/.test(clean)) return null;
-  let v = 0n;
-  const R = BigInt(radix);
-  for (const ch of clean.toLowerCase()) v = v * R + BigInt(parseInt(ch, 16));
-  return neg ? -v : v;
-}
-
 // ------------------------------------------------------------------ clipboard & toasts
 export function toast(msg, kind = '') {
   const t = el('div.toast' + (kind ? '.' + kind : ''), { text: msg });
@@ -339,38 +314,9 @@ export function menu(anchor, items) {
     const i = btns.indexOf(document.activeElement);
     if (e.key === 'ArrowDown') { e.preventDefault(); btns[(i + 1) % btns.length].focus(); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); btns[(i - 1 + btns.length) % btns.length].focus(); }
-    else if (e.key === 'Escape') { e.preventDefault(); closeMenu(); anchor.focus(); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeMenu(); anchor.focus(); }
   });
   return m;
 }
 document.addEventListener('mousedown', e => { if (openMenu && !openMenu.contains(e.target)) closeMenu(); }, true);
 
-/** Modal overlay; returns {root, close}. Esc and scrim clicks close it; focus returns. */
-export function modal(node, { onClose } = {}) {
-  const prevFocus = document.activeElement;
-  const scrim = el('div.scrim');
-  let closed = false;
-  const close = () => {
-    if (closed) return;
-    closed = true;
-    scrim.remove(); node.remove();
-    document.removeEventListener('keydown', key, true);
-    if (onClose) onClose();
-    if (prevFocus && prevFocus.focus) prevFocus.focus();
-  };
-  const key = e => {
-    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
-    if (e.key === 'Tab') { // focus trap
-      const f = [...node.querySelectorAll('button, input, select, textarea, [tabindex="0"], a[href]')].filter(x => !x.disabled && x.offsetParent);
-      if (!f.length) return;
-      if (e.shiftKey && document.activeElement === f[0]) { e.preventDefault(); f[f.length - 1].focus(); }
-      else if (!e.shiftKey && document.activeElement === f[f.length - 1]) { e.preventDefault(); f[0].focus(); }
-    }
-  };
-  scrim.addEventListener('mousedown', close);
-  document.addEventListener('keydown', key, true);
-  node.setAttribute('role', node.getAttribute('role') || 'dialog');
-  node.setAttribute('aria-modal', 'true');
-  document.body.append(scrim, node);
-  return { root: node, close };
-}

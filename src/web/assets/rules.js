@@ -39,7 +39,8 @@ function matcher(field, spec) {
   const re = /^\/(.*)\/([a-z]*)$/s.exec(spec);
   if (re) {
     let rx;
-    try { rx = new RegExp(re[1], re[2]); } catch (e) { throw new Error(`"${field}": bad regular expression: ${e.message}`); }
+    // without g and y: test() would carry lastIndex from one process to the next
+    try { rx = new RegExp(re[1], re[2].replace(/[gy]/g, '')); } catch (e) { throw new Error(`"${field}": bad regular expression: ${e.message}`); }
     return v => v !== null && rx.test(String(v));
   }
   const cmp = /^(>=|<=|>|<|=)\s*(.+)$/.exec(spec);
@@ -78,11 +79,15 @@ export function compileRules(text, fileName) {
 
 // the loaded rules; the server keeps the file with the saved analysis (~/.fvol/<dump_id>-metadata.json)
 let loaded = null;
+// bumped by every change: a saved-rules answer that arrives after a newer change is ignored
+let gen = 0;
 
 /** The rules of the open analysis, from the server. */
 export async function loadSavedRules() {
+  const mine = ++gen;
   let saved = null;
   try { saved = await api('rules'); } catch (e) { saved = null; }
+  if (mine !== gen) return loaded;
   loaded = null;
   if (saved && saved.text) {
     try { loaded = compileRules(saved.text, saved.file); } catch (e) { toast(`${saved.file}: ${e.message}`, 'bad'); }
@@ -91,11 +96,13 @@ export async function loadSavedRules() {
 }
 export function setRules(text, file) {
   loaded = compileRules(text, file);   // throws on a bad file: the old rules stay
+  gen++;
   api('rules', { method: 'POST', body: { file, text } }).catch(e => toast('Could not save the rules: ' + e.message, 'bad'));
   return loaded;
 }
 export function clearRules() {
   loaded = null;
+  gen++;
   api('rules', { method: 'DELETE' }).catch(e => toast('Could not remove the rules: ' + e.message, 'bad'));
 }
 export function currentRules() { return loaded; }

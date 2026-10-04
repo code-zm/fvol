@@ -93,6 +93,8 @@ pub struct Session {
     pub offline: bool,
     pub created: Instant,
     pub warm: Mutex<(Warm, Summary)>,
+    /// why this image's saved analysis is not in use (it could not be read), for the UI
+    pub notice: Mutex<Option<String>>,
     proc_layers: Mutex<HashMap<i128, Option<LayerRef>>>,
 }
 
@@ -165,6 +167,7 @@ impl Session {
             offline: o.offline,
             created: Instant::now(),
             warm: Mutex::new((warm, Summary::default())),
+            notice: Mutex::new(None),
             proc_layers: Mutex::new(HashMap::new()),
         })
     }
@@ -347,6 +350,7 @@ impl Session {
         w.ks("state", st);
         w.key("phase").opt_s(phase);
         w.key("error").opt_s(err);
+        w.key("notice").opt_s(self.notice.lock().unwrap_or_else(|e| e.into_inner()).as_deref());
         w.key("os").opt_s(sum.os);
         w.key("arch").opt_s(sum.arch);
         w.ku("warm_ms", sum.warm_ms);

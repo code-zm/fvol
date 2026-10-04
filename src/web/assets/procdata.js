@@ -4,7 +4,9 @@
 import { store, emit, runPlugin, whenDone, allRows, cellText, parseTime } from './core.js';
 import { PROCLIST, PCOLS, WIN_PARENTS, WIN_SINGLETONS, SUSPICIOUS_CHILDREN } from './catalog.js';
 
-const state = { loadedFor: null, loading: null, byPid: new Map(), t0: null, t1: null };
+// key: the opening of the image the list belongs to (session id and warm-up), gen: bumped when it
+// is dropped, so a list still loading for an earlier image is thrown away
+const state = { key: null, gen: 0, loading: null, byPid: new Map(), t0: null, t1: null };
 
 export const firstPlugin = cands => cands.find(n => store.pluginMap.has(n));
 
@@ -28,19 +30,40 @@ export function relToCapture(t, cap) {
   return cap - t > 0 ? `${txt} before capture` : `${txt} after capture`;
 }
 
+/** Follow the session: the process list of the image once it is ready. Another image, or the
+ * same one reopened with new options, drops the list and loads it again. */
+export function syncProcesses() {
+  const s = store.session;
+  const ready = !!(s && s.state === 'ready' && s.os);
+  const key = ready ? `${s.id}/${s.warm_ms}` : null;
+  if (key !== state.key) {
+    state.key = key;
+    state.gen++;
+    state.loading = null;
+    if (store.procs || store.procError || store.captureGuess) {
+      store.procs = null;
+      store.procError = null;
+      store.captureGuess = null;
+      emit('procs', null);
+    }
+  }
+  return ready ? loadProcesses() : Promise.resolve(null);
+}
+
 /** Load the process list of the current session once (the server keeps the run). */
 export function loadProcesses() {
   const s = store.session;
   if (!s || s.state !== 'ready' || !s.os) return Promise.resolve(null);
-  if (state.loadedFor === s.id && state.loading) return state.loading;
-  state.loadedFor = s.id;
-  store.procs = null;
-  store.procError = null;
-  state.loading = loadFor(s).catch(e => { store.procError = e.message; emit('procs', null); return null; });
+  if (state.loading) return state.loading;
+  const gen = state.gen;
+  state.loading = loadFor(s, gen).catch(e => {
+    if (gen === state.gen) { store.procError = e.message; emit('procs', null); }
+    return null;
+  });
   return state.loading;
 }
 
-async function loadFor(s) {
+async function loadFor(s, gen) {
   const name = firstPlugin(PROCLIST[s.os] || []);
   if (!name) throw new Error('No process list plugin for this OS in this build.');
   const run = await runPlugin(name, {}, { reuse: true, origin: 'spine' });
@@ -48,6 +71,7 @@ async function loadFor(s) {
   const done = await whenDone(run.id);
   if (done.status !== 'done') throw new Error((done.error && (done.error.title || done.error.message)) || 'The process list failed.');
   const rows = await allRows(run.id);
+  if (gen !== state.gen) return null;   // another image meanwhile
   const ix = Object.fromEntries(Object.entries(PCOLS).map(([k, names]) => [k, col(done.cols, names)]));
   const g = (row, k) => (ix[k] >= 0 ? row[ix[k] + 2] : null);
   const procs = rows.map((row, i) => ({

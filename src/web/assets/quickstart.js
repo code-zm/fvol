@@ -72,8 +72,8 @@ export function showQuickStart() {
     }
 
     function onKey(e) {
-      if (e.target && e.target.tagName === 'INPUT') { if (e.key === 'Escape') e.target.blur(); return; }
-      if (e.key === 'Escape') { e.preventDefault(); done(); return; }
+      if (e.target && e.target.tagName === 'INPUT') { if (e.key === 'Escape') { e.stopPropagation(); e.target.blur(); } return; }
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(); return; }
       const n = +e.key;
       if (n >= 1 && n <= choices.length && !e.ctrlKey && !e.altKey && !e.metaKey) { e.preventDefault(); select(choices[n - 1].id); buttons[n - 1].focus(); }
     }
@@ -224,7 +224,7 @@ export function showQuickStart() {
         if (!items.length) { list.append(el('div.qs-empty', { text: 'No saved analyses yet: open a memory image and run some plugins.' })); return; }
         for (const a of items) {
           const ok = a.state === 'ok';
-          const why = a.state === 'missing' ? 'the dump is no longer at this path' : a.state === 'changed' ? 'the dump changed since (a different size or date)' : '';
+          const why = a.state === 'missing' ? 'the dump is no longer at this path' : a.state === 'changed' ? 'the dump changed since (a different size or date)' : a.state === 'unreadable' ? `this file cannot be read (${a.error}); delete it to save the dump again` : '';
           const open = async () => {
             errBox.textContent = '';
             try { await api('session', { method: 'POST', body: { file: a.image } }); done(); }
@@ -246,7 +246,7 @@ export function showQuickStart() {
             del);
           if (ok) {
             row.addEventListener('click', open);
-            row.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); open(); } if (e.key === 'Delete') del.click(); });
+            row.addEventListener('keydown', e => { if (e.target !== row) return; if (e.key === 'Enter') { e.preventDefault(); open(); } if (e.key === 'Delete') del.click(); });
           }
           list.append(row);
         }

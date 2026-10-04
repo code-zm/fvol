@@ -2,7 +2,7 @@
 
 import { store, api, on, el, startEvents, TOKEN, setToken } from './core.js';
 import { renderAll, wire } from './workspace.js';
-import { loadProcesses } from './procdata.js';
+import { syncProcesses } from './procdata.js';
 import { showQuickStart } from './quickstart.js';
 import { initSplitters } from './layout.js';
 import { showOptions } from './options.js';
@@ -75,9 +75,8 @@ async function main() {
   wire();
   renderAll();
   // the process list feeds the triage hints; load it whenever an image is ready
-  const procs = () => { if (store.session && store.session.state === 'ready') loadProcesses(); };
-  on('session', procs);
-  procs();
+  on('session', syncProcesses);
+  syncProcesses();
   startEvents();
   await showQuickStart();
   document.getElementById('main').focus();

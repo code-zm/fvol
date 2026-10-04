@@ -202,13 +202,15 @@ export class VirtualTable {
   guides(vi, depth) {
     const out = new Array(depth).fill('v');
     let top = depth;                  // deepest level not decided yet
-    for (let k = vi + 1; top > 0 && k < this.total && k < vi + 4096; k++) {
+    let k = vi + 1;
+    for (; top > 0 && k < this.total && k < vi + 4096; k++) {
       const r = this.rowAt(k);
       if (!r) break;                  // not loaded: assume the lines continue
       const d = r[1] >> 2;
       while (top >= 1 && top >= d) { out[top - 1] = top === d ? 'v' : ' '; top--; }
     }
-    if (vi + 1 >= this.total) for (let l = top; l >= 1; l--) out[l - 1] = ' ';
+    // the table ended before those levels came back: nothing below continues them
+    if (k >= this.total) for (let l = top; l >= 1; l--) out[l - 1] = ' ';
     out[depth - 1] = out[depth - 1] === 'v' ? 't' : 'e';
     return out.join('');
   }

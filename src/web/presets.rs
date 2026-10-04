@@ -17,8 +17,12 @@ use std::path::{Path, PathBuf};
 /// Largest preset file read or written (a preset is a short list of plugins).
 const MAX_FILE: u64 = 256 << 10;
 
-/// `~/.fvol`: fastvol's own user data (saved analyses, presets); not a cache.
+/// `~/.fvol`: fastvol's own user data (saved analyses, presets); not a cache. Unit tests get a
+/// folder of their own, so they never touch the real one.
 pub fn fvol_dir() -> PathBuf {
+    #[cfg(test)]
+    return std::env::temp_dir().join(format!("fastvol-test-home-{}", std::process::id())).join(".fvol");
+    #[cfg(not(test))]
     crate::util::paths::home_dir().join(".fvol")
 }
 

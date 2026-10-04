@@ -1,7 +1,6 @@
 /* fastvol web UI — "workbench": the new design system.
    Graphite surfaces, the logo's green as the one accent, a sans-serif for the interface and
-   monospace only for data (PIDs, addresses, hex). No external resources.
-   Tokens are named apart from app.css so both can coexist while the views are rewritten. */
+   monospace only for data (PIDs, addresses, hex). No external resources. */
 
 :root {
   /* the platform's own fonts, as native tools use them: Segoe UI / Consolas on Windows,

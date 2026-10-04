@@ -87,7 +87,7 @@ export async function showOptions() {
     el('div.op-head', {}, el('h2#op-h', { text: 'Options' }), el('span.op-sub', { text: 'The fvol command-line options. Saved with this analysis.' })),
     body, errBox, el('div.dl-actions', {}, cancel, save));
   const close = () => { scrim.remove(); box.remove(); removeEventListener('keydown', onKey, true); };
-  const onKey = e => { if (e.key === 'Escape') { e.preventDefault(); close(); } };
+  const onKey = e => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); } };
   cancel.addEventListener('click', close);
   scrim.addEventListener('click', close);
   save.addEventListener('click', async () => {

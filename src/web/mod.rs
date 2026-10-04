@@ -88,7 +88,8 @@ impl App {
             tickets: security::Tickets::default(),
             export_seq: AtomicU64::new(1),
             started: Instant::now(),
-            options: Mutex::new(cli_options.clone()),
+            // -o is `default_out`, not an option the dialog shows (its folder may not exist yet)
+            options: Mutex::new(options::Options { output_dir: None, ..cli_options.clone() }),
             cli_options,
             rules: Mutex::new(None),
             analysis: Mutex::new(None),
@@ -111,17 +112,35 @@ impl App {
     /// back. `same_session`: reopen the open dump with changed options, keeping its runs.
     pub fn open_image(self: &Arc<Self>, image: Option<PathBuf>, same_session: bool) -> Result<Arc<Session>, String> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+        // held until the new image's analysis is in place: the background saver never sees one
+        // dump's analysis with another's runs
+        let mut analysis = self.analysis.lock().unwrap_or_else(|e| e.into_inner());
         let mut meta = None;
         let mut fresh = None;
+        // a same-session reopen keeps its notice: its analysis is still not in use
+        let mut notice = if same_session { self.session().notice.lock().unwrap_or_else(|e| e.into_inner()).clone() } else { None };
         if !same_session {
             // the background saver runs about once a second: save the dump being left now, so a
             // change made just before switching is not lost
-            analysis::save(self);
+            if let Some(a) = analysis.as_mut() {
+                analysis::save_in(self, a);
+            }
             fresh = image.as_deref().and_then(analysis::Analysis::new);
-            meta = fresh.as_ref().and_then(|a| analysis::load(&a.id));
+            if let Some(a) = &fresh {
+                match analysis::load(&a.id) {
+                    Ok(m) => meta = m,
+                    Err(e) => {
+                        // left as it is: nothing is restored from it or saved over it
+                        notice = Some(format!("The saved analysis of this dump could not be read, so it was not restored and this session is not saved: {e}. Delete it from Quick Start > Previous to start saving again."));
+                        fresh = None;
+                    }
+                }
+            }
             if let Some(m) = &meta {
-                if let Some(o) = m.get("options").and_then(|o| options::Options::from_json(o, &cwd).ok()) {
-                    *self.options.lock().unwrap_or_else(|e| e.into_inner()) = self.with_cli(o);
+                match m.get("options").map(|o| options::Options::from_json(o, &cwd)) {
+                    Some(Ok(o)) => *self.options.lock().unwrap_or_else(|e| e.into_inner()) = self.with_cli(o),
+                    Some(Err(e)) => notice = Some(format!("The saved options of this dump were not restored: {e}")),
+                    None => {}
                 }
                 *self.rules.lock().unwrap_or_else(|e| e.into_inner()) = m.get("rules").and_then(|r| Some((r.get("file")?.as_str()?.to_string(), r.get("text")?.as_str()?.to_string())));
             }
@@ -132,6 +151,7 @@ impl App {
         opts.apply_opening(&mut o, &self.default_out);
         let id = if same_session { self.session().id } else { self.next_session.fetch_add(1, Ordering::Relaxed) };
         let s = Arc::new(Session::new(id, &o).map_err(|e| e.to_string())?);
+        *s.notice.lock().unwrap_or_else(|e| e.into_inner()) = notice;
         // --clear-cache acts once, at this open
         if opts.clear_cache {
             self.options.lock().unwrap_or_else(|e| e.into_inner()).clear_cache = false;
@@ -140,11 +160,17 @@ impl App {
         *self.session.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
         self.apply_run_options(&opts);
         if !same_session {
-            *self.analysis.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
-            if let Some(m) = &meta {
-                analysis::restore(self, &s, m);
+            // the runs of the image left behind go (their results were saved just above): a run
+            // id then belongs to one image only, also once a saved analysis brings its ids back
+            for b in self.runs.batches().into_iter().filter(|b| b.session != s.id) {
+                self.runs.remove_batch(b.id);
+            }
+            *analysis = fresh.map(|a| analysis::Analysis { session: s.id, ..a });
+            if let (Some(a), Some(m)) = (analysis.as_mut(), &meta) {
+                analysis::restore(self, &s, m, a);
             }
         }
+        drop(analysis);
         self.hub.bump();
         self.start_warm_up(s.clone());
         Ok(s)
@@ -156,20 +182,30 @@ impl App {
     }
 
     /// Delete a saved analysis. For the dump that is open, its runs and results go too and it
-    /// starts over (its options stay in use, so its analysis is saved again, empty).
+    /// starts over (its options stay in use, so its analysis is saved again, empty); one that
+    /// could not be read is replaced by a new one.
     pub fn delete_analysis(&self, id: &str) -> Result<(), String> {
         // the saver waits on this lock: nothing is written back halfway
         let mut guard = self.analysis.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(a) = guard.as_mut().filter(|a| a.id == id) {
-            let session = self.session().id;
-            for b in self.runs.batches().into_iter().filter(|b| b.session == session) {
+            for b in self.runs.batches().into_iter().filter(|b| b.session == a.session) {
                 self.runs.remove_batch(b.id);
             }
             a.saved_rows.clear();
             a.last.clear();
             a.created_ms = runs::now_ms();
         }
-        analysis::delete_in(&presets::fvol_dir(), id)
+        analysis::delete_in(&presets::fvol_dir(), id)?;
+        // the open dump's analysis could not be read: with the file gone, it is saved from now on
+        let s = self.session();
+        if guard.is_none()
+            && let Some(a) = s.image.as_deref().and_then(analysis::Analysis::new).filter(|a| a.id == id)
+        {
+            *guard = Some(analysis::Analysis { session: s.id, ..a });
+            *s.notice.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.hub.bump();
+        }
+        Ok(())
     }
 
     /// Options from the Options dialog. Returns whether the image was reopened (an option that
@@ -203,6 +239,10 @@ impl App {
         }
         if c.cache_path.is_some() {
             o.cache_path = c.cache_path.clone();
+        }
+        // -o: the folder `fvol serve` was given (`default_out`) instead of a saved one
+        if c.output_dir.is_some() {
+            o.output_dir = None;
         }
         o
     }
@@ -402,7 +442,14 @@ pub fn main(args: &[String]) -> i32 {
     let symbol_dirs: Vec<String> = symbol_dirs.iter().map(|d| crate::cli::abspath(d, &cwd.to_string_lossy())).collect();
     let opts = SessionOpts { image: image.clone(), symbol_dirs, out_root: out_root.clone(), offline, remote_isf_url: remote, cache_path: cache, ..Default::default() };
     let hosts = security::HostPolicy { port, wildcard: ip.is_unspecified(), bind: if ip.is_unspecified() { None } else { Some(ip) }, names: allow };
-    let cli_options = options::Options { symbol_dirs: opts.symbol_dirs.clone(), offline: opts.offline, remote_isf_url: opts.remote_isf_url.clone(), cache_path: opts.cache_path.clone(), ..Default::default() };
+    let cli_options = options::Options {
+        symbol_dirs: opts.symbol_dirs.clone(),
+        offline: opts.offline,
+        remote_isf_url: opts.remote_isf_url.clone(),
+        cache_path: opts.cache_path.clone(),
+        output_dir: out.as_ref().map(|_| out_root.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
     let app = match App::new(token.clone(), port, hosts, opts, parallel, budget, cli_options) {
         Ok(a) => a,
         Err(e) => {

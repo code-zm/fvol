@@ -82,6 +82,7 @@ export function renderOverview() {
   const facts = present((s.facts || []).filter(([k]) => !HIDDEN_FACTS.has(k)).map(([k, v]) => [k, v, isAddr(v) ? 'addr' : '']));
   const w = Math.max(...info.concat(facts).map(([k]) => k.length)) + 3;
   box.append(...section(info, w));
+  if (s.notice) box.append(blank(), comment('saved analysis'), el('div.tl.bad', { text: s.notice }));
   if (s.state === 'failed') {
     box.append(blank(), comment('error'), el('div.tl.bad', { text: s.error || 'The image could not be analysed.' }));
     for (const b of s.banners || []) box.append(el('div.tl.tdim', { text: 'banner: ' + b }));
@@ -255,7 +256,7 @@ function presetRow(p) {
     toast(`Selected ${pl.sel.size} plugin${pl.sel.size === 1 ? '' : 's'} from “${p.name}”`);
   };
   row.addEventListener('click', use);
-  row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); use(); } });
+  row.addEventListener('keydown', e => { if (e.target !== row) return; if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); use(); } });
   return row;
 }
 
@@ -281,7 +282,7 @@ function savePresetDialog() {
     errBox,
     el('div.dl-actions', {}, cancel, saveBtn));
   const close = () => { scrim.remove(); box.remove(); removeEventListener('keydown', onKey, true); };
-  const onKey = e => { if (e.key === 'Escape') { e.preventDefault(); close(); } if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); save(false); } };
+  const onKey = e => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); } if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); save(false); } };
   async function save(overwrite) {
     errBox.replaceChildren();
     if (!name.value.trim()) { errBox.textContent = 'Give the preset a name.'; name.focus(); return; }
@@ -397,11 +398,11 @@ function batchItem(b) {
     name.addEventListener('click', e => e.stopPropagation());
     setTimeout(() => { name.focus(); name.select(); }, 0);
   } else {
-    name = el('button.rn-bname', { type: 'button', text: b.name, title: 'Rename', on: { click: e => { e.stopPropagation(); runsUi.renaming = b.id; renderRuns(); } } });
+    name = el('button.rn-bname', { type: 'button', text: b.name, title: 'Rename', dataset: { key: `b${b.id}n` }, on: { click: e => { e.stopPropagation(); runsUi.renaming = b.id; renderRuns(); } } });
   }
   const action = st.active
-    ? el('button.rn-act', { type: 'button', text: 'Cancel', title: 'Cancel the plugins still queued or running', on: { click: async e => { e.stopPropagation(); try { await api(`batches/${b.id}/cancel`, { method: 'POST' }); } catch (x) { toast(x.message, 'bad'); } } } })
-    : el('button.rn-act', { type: 'button', text: 'Remove', title: 'Remove this run and its results', on: { click: async e => {
+    ? el('button.rn-act', { type: 'button', text: 'Cancel', title: 'Cancel the plugins still queued or running', dataset: { key: `b${b.id}a` }, on: { click: async e => { e.stopPropagation(); try { await api(`batches/${b.id}/cancel`, { method: 'POST' }); } catch (x) { toast(x.message, 'bad'); } } } })
+    : el('button.rn-act', { type: 'button', text: 'Remove', title: 'Remove this run and its results', dataset: { key: `b${b.id}a` }, on: { click: async e => {
       e.stopPropagation();
       if (!confirm(`Remove “${b.name}” and its results?`)) return;
       try { await api(`batches/${b.id}`, { method: 'DELETE' }); store.batches = store.batches.filter(x => x.id !== b.id); renderRuns(); } catch (x) { toast(x.message, 'bad'); }
@@ -414,7 +415,7 @@ function batchItem(b) {
     el('span.rn-time', { text: clock(st.elapsed) }),
     action);
   head.addEventListener('click', show);
-  head.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); show(); } if (e.key === ' ' || e.key === 'ArrowRight' || e.key === 'ArrowLeft') { e.preventDefault(); toggle(); } if (e.key === 'F2') { runsUi.renaming = b.id; renderRuns(); } });
+  head.addEventListener('keydown', e => { if (e.target !== head) return; if (e.key === 'Enter') { e.preventDefault(); show(); } if (e.key === ' ' || e.key === 'ArrowRight' || e.key === 'ArrowLeft') { e.preventDefault(); toggle(); } if (e.key === 'F2') { runsUi.renaming = b.id; renderRuns(); } });
   li.append(head);
   if (open) {
     const ul = el('ul.rn-entries');
@@ -426,7 +427,7 @@ function batchItem(b) {
         el('span', { class: 'rn-dot ' + r.status }),
         el('span.rn-name', {}, shortName(r.plugin), r.args.length ? el('span.rn-args', { text: ' ' + r.args.join(' ') }) : null),
         el('span', { class: 'rn-meta ' + r.status, text: meta }),
-        ACTIVE(r.status) ? el('button.rn-act', { type: 'button', text: 'Cancel', title: 'Cancel this plugin', on: { click: async e => { e.stopPropagation(); try { await api(`runs/${r.id}/cancel`, { method: 'POST' }); } catch (x) { toast(x.message, 'bad'); } } } }) : el('span'));
+        ACTIVE(r.status) ? el('button.rn-act', { type: 'button', text: 'Cancel', title: 'Cancel this plugin', dataset: { key: `r${r.id}c` }, on: { click: async e => { e.stopPropagation(); try { await api(`runs/${r.id}/cancel`, { method: 'POST' }); } catch (x) { toast(x.message, 'bad'); } } } }) : el('span'));
       row.addEventListener('click', () => { openResults(b.id, r.id); renderRuns(); });
       if (openBatchId() === b.id) row.classList.add('pick');
       ul.append(row);
@@ -513,7 +514,10 @@ export function wire() {
   $('pl-run').addEventListener('click', startSelected);
   $('pl-save').addEventListener('click', savePresetDialog);
   let sid = store.session && store.session.id;
-  on('session', () => { renderTopbar(); renderOverview(); renderTriage(); renderRuns(); if (store.session.id !== sid) { sid = store.session.id; refreshRules(); } });
+  let notice = null;
+  const tellNotice = () => { const n = store.session && store.session.notice; if (n && n !== notice) toast(n, 'bad'); notice = n; };
+  tellNotice();
+  on('session', () => { renderTopbar(); renderOverview(); renderTriage(); renderRuns(); tellNotice(); if (store.session.id !== sid) { sid = store.session.id; refreshRules(); } });
   on('procs', () => { renderTopbar(); renderOverview(); renderTriage(); });
   on('runs', () => { if (!runsUi.renaming) renderRuns(); });
   on('batches', () => { if (!runsUi.renaming) renderRuns(); });
