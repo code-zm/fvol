@@ -11,11 +11,15 @@
 //! call; Host headers are validated (DNS rebinding); no CORS; cross-site requests refused;
 //! strict request limits; downloads only from a run's own output directory.
 
+pub mod analysis;
 pub mod api;
 pub mod assets;
 pub mod http;
 pub mod jsonw;
 pub mod mem;
+pub mod options;
+pub mod picker;
+pub mod presets;
 pub mod runs;
 pub mod security;
 pub mod server;
@@ -49,30 +53,49 @@ pub struct App {
     pub tickets: security::Tickets,
     pub export_seq: AtomicU64,
     pub started: Instant,
+    /// the global fvol options (the Options dialog), saved with the analysis
+    pub options: Mutex<options::Options>,
+    /// options given on the `fvol serve` command line: they win over a saved analysis's
+    cli_options: options::Options,
+    /// the output folder `fvol serve -o` was given (used unless the options name another)
+    default_out: PathBuf,
+    /// the loaded triage rules file (name, content), saved with the analysis
+    pub rules: Mutex<Option<(String, String)>>,
+    /// the saved analysis of the open dump (`~/.fvol/<dump_id>-metadata.json`)
+    pub analysis: Mutex<Option<analysis::Analysis>>,
 }
 
 impl App {
-    pub fn new(token: String, port: u16, hosts: security::HostPolicy, opts: SessionOpts, max_parallel: usize, budget: u64) -> Result<Arc<App>, String> {
+    pub fn new(token: String, port: u16, hosts: security::HostPolicy, opts: SessionOpts, max_parallel: usize, budget: u64, cli_options: options::Options) -> Result<Arc<App>, String> {
         let plugins = crate::plugins::all();
         let hub = Arc::new(Hub::default());
-        let session = Arc::new(Session::new(1, &opts).map_err(|e| e.to_string())?);
+        let image = opts.image.clone();
+        let idle = SessionOpts { image: None, ..opts.clone() };
+        let session = Arc::new(Session::new(1, &idle).map_err(|e| e.to_string())?);
         let app = Arc::new(App {
             token,
             port,
             hosts,
             plugins_json: api::plugins_json(&plugins),
             plugins,
-            session: RwLock::new(session.clone()),
+            session: RwLock::new(session),
+            default_out: opts.out_root.clone(),
             base_opts: Mutex::new(opts),
             runs: Arc::new(Runs::new(hub.clone(), max_parallel, budget)),
             hub,
-            next_session: AtomicU64::new(2),
+            next_session: AtomicU64::new(1),
             auth_failures: AtomicU64::new(0),
             tickets: security::Tickets::default(),
             export_seq: AtomicU64::new(1),
             started: Instant::now(),
+            // -o is `default_out`, not an option the dialog shows (its folder may not exist yet)
+            options: Mutex::new(options::Options { output_dir: None, ..cli_options.clone() }),
+            cli_options,
+            rules: Mutex::new(None),
+            analysis: Mutex::new(None),
         });
-        app.start_warm_up(session);
+        app.open_image(image, false)?;
+        analysis::start_saver(app.clone());
         Ok(app)
     }
 
@@ -85,15 +108,149 @@ impl App {
         let _ = std::thread::Builder::new().name("warm-up".into()).stack_size(64 << 20).spawn(move || s.warm_up(&me.hub, &me.plugins));
     }
 
-    /// Switch to another image (explicit user action).
-    pub fn open(self: &Arc<Self>, o: SessionOpts) -> Result<Arc<Session>, String> {
-        let id = self.next_session.fetch_add(1, Ordering::Relaxed);
+    /// Open an image (or none). A dump with a saved analysis gets its options, rules and runs
+    /// back. `same_session`: reopen the open dump with changed options, keeping its runs.
+    pub fn open_image(self: &Arc<Self>, image: Option<PathBuf>, same_session: bool) -> Result<Arc<Session>, String> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+        // held until the new image's analysis is in place: the background saver never sees one
+        // dump's analysis with another's runs
+        let mut analysis = self.analysis.lock().unwrap_or_else(|e| e.into_inner());
+        let mut meta = None;
+        let mut fresh = None;
+        // a same-session reopen keeps its notice: its analysis is still not in use
+        let mut notice = if same_session { self.session().notice.lock().unwrap_or_else(|e| e.into_inner()).clone() } else { None };
+        if !same_session {
+            // the background saver runs about once a second: save the dump being left now, so a
+            // change made just before switching is not lost
+            if let Some(a) = analysis.as_mut() {
+                analysis::save_in(self, a);
+            }
+            fresh = image.as_deref().and_then(analysis::Analysis::new);
+            if let Some(a) = &fresh {
+                match analysis::load(&a.id) {
+                    Ok(m) => meta = m,
+                    Err(e) => {
+                        // left as it is: nothing is restored from it or saved over it
+                        notice = Some(format!("The saved analysis of this dump could not be read, so it was not restored and this session is not saved: {e}. Delete it from Quick Start > Previous to start saving again."));
+                        fresh = None;
+                    }
+                }
+            }
+            if let Some(m) = &meta {
+                match m.get("options").map(|o| options::Options::from_json(o, &cwd)) {
+                    Some(Ok(o)) => *self.options.lock().unwrap_or_else(|e| e.into_inner()) = self.with_cli(o),
+                    Some(Err(e)) => notice = Some(format!("The saved options of this dump were not restored: {e}")),
+                    None => {}
+                }
+                *self.rules.lock().unwrap_or_else(|e| e.into_inner()) = m.get("rules").and_then(|r| Some((r.get("file")?.as_str()?.to_string(), r.get("text")?.as_str()?.to_string())));
+            }
+        }
+        let opts = self.options.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut o = self.base_opts.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        o.image = image;
+        opts.apply_opening(&mut o, &self.default_out);
+        let id = if same_session { self.session().id } else { self.next_session.fetch_add(1, Ordering::Relaxed) };
         let s = Arc::new(Session::new(id, &o).map_err(|e| e.to_string())?);
-        *self.base_opts.lock().unwrap_or_else(|e| e.into_inner()) = o;
+        *s.notice.lock().unwrap_or_else(|e| e.into_inner()) = notice;
+        // --clear-cache acts once, at this open
+        if opts.clear_cache {
+            self.options.lock().unwrap_or_else(|e| e.into_inner()).clear_cache = false;
+        }
+        *self.base_opts.lock().unwrap_or_else(|e| e.into_inner()) = SessionOpts { clear_cache: false, ..o };
         *self.session.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+        self.apply_run_options(&opts);
+        if !same_session {
+            // the runs of the image left behind go (their results were saved just above): a run
+            // id then belongs to one image only, also once a saved analysis brings its ids back
+            for b in self.runs.batches().into_iter().filter(|b| b.session != s.id) {
+                self.runs.remove_batch(b.id);
+            }
+            *analysis = fresh.map(|a| analysis::Analysis { session: s.id, ..a });
+            if let (Some(a), Some(m)) = (analysis.as_mut(), &meta) {
+                analysis::restore(self, &s, m, a);
+            }
+        }
+        drop(analysis);
         self.hub.bump();
         self.start_warm_up(s.clone());
         Ok(s)
+    }
+
+    /// Switch to another image (explicit user action).
+    pub fn open(self: &Arc<Self>, image: PathBuf) -> Result<Arc<Session>, String> {
+        self.open_image(Some(image), false)
+    }
+
+    /// Delete a saved analysis. For the dump that is open, its runs and results go too and it
+    /// starts over (its options stay in use, so its analysis is saved again, empty); one that
+    /// could not be read is replaced by a new one.
+    pub fn delete_analysis(&self, id: &str) -> Result<(), String> {
+        // the saver waits on this lock: nothing is written back halfway
+        let mut guard = self.analysis.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(a) = guard.as_mut().filter(|a| a.id == id) {
+            for b in self.runs.batches().into_iter().filter(|b| b.session == a.session) {
+                self.runs.remove_batch(b.id);
+            }
+            a.saved_rows.clear();
+            a.last.clear();
+            a.created_ms = runs::now_ms();
+        }
+        analysis::delete_in(&presets::fvol_dir(), id)?;
+        // the open dump's analysis could not be read: with the file gone, it is saved from now on
+        let s = self.session();
+        if guard.is_none()
+            && let Some(a) = s.image.as_deref().and_then(analysis::Analysis::new).filter(|a| a.id == id)
+        {
+            *guard = Some(analysis::Analysis { session: s.id, ..a });
+            *s.notice.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.hub.bump();
+        }
+        Ok(())
+    }
+
+    /// Options from the Options dialog. Returns whether the image was reopened (an option that
+    /// decides how it is opened changed).
+    pub fn set_options(self: &Arc<Self>, new: options::Options) -> Result<bool, String> {
+        let old = std::mem::replace(&mut *self.options.lock().unwrap_or_else(|e| e.into_inner()), new.clone());
+        let session = self.session();
+        let reopen = old.opening_differs(&new) && session.image.is_some();
+        if reopen {
+            self.open_image(session.image.clone(), true)?;
+        } else {
+            self.apply_run_options(&new);
+            self.hub.bump();
+        }
+        Ok(reopen)
+    }
+
+    /// Options given on the command line win over saved ones.
+    fn with_cli(&self, mut o: options::Options) -> options::Options {
+        let c = &self.cli_options;
+        if !c.symbol_dirs.is_empty() {
+            o.symbol_dirs = c.symbol_dirs.clone();
+        }
+        if c.offline {
+            o.offline = true;
+            o.remote_isf_url = None;
+        }
+        if c.remote_isf_url.is_some() {
+            o.remote_isf_url = c.remote_isf_url.clone();
+            o.offline = false;
+        }
+        if c.cache_path.is_some() {
+            o.cache_path = c.cache_path.clone();
+        }
+        // -o: the folder `fvol serve` was given (`default_out`) instead of a saved one
+        if c.output_dir.is_some() {
+            o.output_dir = None;
+        }
+        o
+    }
+
+    fn apply_run_options(self: &Arc<Self>, o: &options::Options) {
+        self.runs.set_parallel(o.parallel(self.runs.max_parallel));
+        *self.runs.log.lock().unwrap_or_else(|e| e.into_inner()) = o.log.clone();
+        *self.runs.config_name.lock().unwrap_or_else(|e| e.into_inner()) = o.config_file_name();
     }
 }
 
@@ -283,9 +440,17 @@ pub fn main(args: &[String]) -> i32 {
         None => cwd.join("vol-serve-output"),
     };
     let symbol_dirs: Vec<String> = symbol_dirs.iter().map(|d| crate::cli::abspath(d, &cwd.to_string_lossy())).collect();
-    let opts = SessionOpts { image: image.clone(), symbol_dirs, out_root: out_root.clone(), offline, remote_isf_url: remote, cache_path: cache };
+    let opts = SessionOpts { image: image.clone(), symbol_dirs, out_root: out_root.clone(), offline, remote_isf_url: remote, cache_path: cache, ..Default::default() };
     let hosts = security::HostPolicy { port, wildcard: ip.is_unspecified(), bind: if ip.is_unspecified() { None } else { Some(ip) }, names: allow };
-    let app = match App::new(token.clone(), port, hosts, opts, parallel, budget) {
+    let cli_options = options::Options {
+        symbol_dirs: opts.symbol_dirs.clone(),
+        offline: opts.offline,
+        remote_isf_url: opts.remote_isf_url.clone(),
+        cache_path: opts.cache_path.clone(),
+        output_dir: out.as_ref().map(|_| out_root.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let app = match App::new(token.clone(), port, hosts, opts, parallel, budget, cli_options) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("fvol serve: {e}");

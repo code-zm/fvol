@@ -7,63 +7,64 @@
 <meta name="color-scheme" content="dark light">
 <title>fastvol</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="preload" href="/assets/mono-400.woff2" as="font" type="font/woff2" crossorigin>
 <script src="/assets/theme.js"></script>
-<link rel="stylesheet" href="/assets/app.css">
+<link rel="stylesheet" href="/assets/ui.css">
 <script type="module" src="/assets/app.js"></script>
 </head>
 <body>
-<a class="skip" href="#main">Skip to results</a>
-<header class="topbar" role="banner">
-  <div class="brand" aria-label="fastvol">
+<header class="wb-top" role="banner">
+  <div class="wb-brand" aria-label="fastvol">
     <svg class="brand-logo" viewBox="0 0 86 16" width="86" height="16" shape-rendering="crispEdges" aria-hidden="true"><path fill="#123020" d="M1 0h22v1h-22zM0 1h24v14h-24zM1 15h22v1h-22z"/><path fill="#46e67a" d="M9 2h5v1h-5zM8 3h6v1h-6zM8 4h3v1h-3zM7 5h3v1h-3zM4 6h10v2h-10zM17 6h3v2h-3zM6 8h3v2h-3zM11 8h3v4h-3zM16 8h3v2h-3zM5 10h3v3h-3zM15 10h3v2h-3zM11 12h6v1h-6zM4 13h3v1h-3zM11 13h4v1h-4z"/><path fill="currentColor" d="M34 2h4v1h-4zM84 2h2v4h-2zM33 3h5v1h-5zM59 3h2v3h-2zM33 4h2v2h-2zM31 6h6v2h-6zM39 6h6v1h-6zM49 6h6v1h-6zM57 6h6v2h-6zM65 6h2v6h-2zM70 6h2v4h-2zM75 6h5v1h-5zM83 6h2v4h-2zM39 7h7v1h-7zM48 7h7v1h-7zM74 7h7v1h-7zM32 8h2v2h-2zM44 8h2v1h-2zM48 8h2v1h-2zM58 8h2v2h-2zM74 8h2v2h-2zM79 8h2v2h-2zM40 9h6v1h-6zM48 9h6v2h-6zM31 10h2v4h-2zM38 10h7v1h-7zM57 10h2v2h-2zM68 10h2v2h-2zM73 10h2v2h-2zM78 10h2v2h-2zM82 10h2v4h-2zM38 11h2v1h-2zM43 11h2v1h-2zM52 11h2v1h-2zM38 12h7v1h-7zM47 12h7v1h-7zM57 12h5v1h-5zM66 12h3v2h-3zM73 12h7v1h-7zM39 13h6v1h-6zM47 13h6v1h-6zM58 13h4v1h-4zM74 13h5v1h-5z"/></svg>
   </div>
-  <button class="evidence" id="evidence" type="button" title="Evidence details (open another image)">
-    <span class="ev-tag">EVIDENCE</span>
-    <span class="ev-name" id="ev-name">no image</span>
-    <span class="ev-meta" id="ev-meta"></span>
-  </button>
-  <button class="cmdk" id="cmdk" type="button" aria-keyshortcuts="Control+K Meta+K">
-    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-    <span>Run a plugin…</span><kbd>Ctrl K</kbd>
-  </button>
-  <div class="activity" id="activity" role="status" aria-live="polite"></div>
-  <button class="iconbtn" id="theme" type="button" title="Toggle light/dark theme (Shift+T)" aria-label="Toggle theme">
-    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 2.5a5.5 5.5 0 0 1 0 11z" fill="currentColor"/></svg>
-  </button>
-  <button class="iconbtn" id="help" type="button" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+  <div class="wb-ev" id="wb-ev"><span class="wb-ev-name" id="wb-ev-name">no image</span><span class="wb-ev-meta" id="wb-ev-meta"></span></div>
+  <div class="wb-top-actions">
+    <button class="wb-btn ghost wb-ovbtn" id="wb-ovbtn" type="button" aria-pressed="false">File Overview</button>
+    <button class="wb-btn ghost" id="wb-options" type="button">Options</button>
+    <button class="wb-btn ghost" id="wb-quickstart" type="button">Quick Start</button>
+    <button class="wb-icon" id="wb-theme" type="button" title="Light or dark theme (Shift+T)" aria-label="Toggle theme">
+      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 2.5a5.5 5.5 0 0 1 0 11z" fill="currentColor"/></svg>
+    </button>
+  </div>
 </header>
-<div class="shell">
-  <aside class="rail" id="rail" aria-label="Processes and history">
-    <section class="rail-sec procs" aria-labelledby="procs-h">
-      <div class="rail-head">
-        <h2 id="procs-h">Processes <span class="count" id="proc-count"></span></h2>
-        <div class="rail-tools">
-          <button class="mini" id="tree-expand" type="button" title="Expand all (*)">+</button>
-          <button class="mini" id="tree-collapse" type="button" title="Collapse all">−</button>
-        </div>
+<main class="wb" id="main" tabindex="-1">
+  <section class="wb-panel wb-overview" aria-labelledby="ov-h">
+    <header class="wb-ph"><h2 id="ov-h">File Overview</h2></header>
+    <div class="wb-pb term" id="overview"></div>
+  </section>
+  <div class="wb-split v" id="s1" role="separator" aria-orientation="vertical" aria-label="Resize File Overview" tabindex="0" title="Drag to resize · double-click to reset"></div>
+  <section class="wb-panel wb-plugins" aria-labelledby="pl-h">
+    <header class="wb-ph pl-head"><h2 id="pl-h">Plugins</h2>
+      <div class="wb-tabs" role="tablist" aria-label="Plugins view">
+        <button class="at-25" type="button" role="tab" id="pl-tab-presets" aria-selected="false">Presets</button>
+        <button class="at-50" type="button" role="tab" id="pl-tab-select" aria-selected="true">Select</button>
       </div>
-      <div class="rail-filter"><input id="proc-filter" type="search" placeholder="Filter name or PID  (T)" aria-label="Filter processes" autocomplete="off" spellcheck="false"></div>
-      <div class="lifeaxis" id="lifeaxis" aria-hidden="true"></div>
-      <div class="tree" id="tree" role="tree" aria-label="Process tree" tabindex="0"></div>
-    </section>
-    <div class="rail-split" id="rail-split" role="separator" aria-orientation="horizontal" aria-label="Resize history" tabindex="0"></div>
-    <section class="rail-sec history" aria-labelledby="hist-h">
-      <div class="rail-head">
-        <h2 id="hist-h">Runs <span class="count" id="run-count"></span></h2>
-        <div class="rail-tools"><button class="mini" id="compare-btn" type="button" title="Compare two runs side by side">⇆</button></div>
-      </div>
-      <ol class="runlist" id="runlist" aria-label="Run history"></ol>
-    </section>
-  </aside>
-  <div class="rail-resize" id="rail-resize" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0"></div>
-  <main class="work" id="main">
-    <nav class="tabs" id="tabs" role="tablist" aria-label="Open views"></nav>
-    <div class="panes" id="panes"></div>
-  </main>
-</div>
-<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
-<div class="conn" id="conn" role="alert" hidden>Connection to the fastvol server lost — reconnecting…</div>
-<noscript><p class="noscript">The fastvol UI needs JavaScript.</p></noscript>
+      <button class="wb-btn outline at-75" id="pl-save" type="button" hidden>Save Preset</button>
+      <button class="wb-btn primary pl-run" id="pl-run" type="button" hidden><span class="rb-play" aria-hidden="true"></span><span id="pl-run-label">Run</span></button>
+    </header>
+    <div class="wb-pb" id="plugins"></div>
+  </section>
+  <section class="wb-panel wb-results" id="results" aria-labelledby="rs-title" hidden>
+    <header class="wb-ph rs-head"><h2 id="rs-title">Results</h2><span class="rs-sum" id="rs-sum"></span>
+      <button class="wb-icon rs-close" id="rs-close" type="button" title="Close results (Esc)" aria-label="Close results">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+    <nav class="rs-tabs" id="rs-tabs" role="tablist" aria-label="Plugins in this run"></nav>
+    <div class="rs-body" id="rs-body"></div>
+  </section>
+  <div class="wb-split v" id="s2" role="separator" aria-orientation="vertical" aria-label="Resize the right column" tabindex="0" title="Drag to resize · double-click to reset"></div>
+  <section class="wb-panel wb-runs" aria-labelledby="rn-h">
+    <header class="wb-ph"><h2 id="rn-h">Runs</h2><span class="wb-count" id="rn-count"></span></header>
+    <div class="wb-pb" id="runs"></div>
+  </section>
+  <div class="wb-split h" id="s3" role="separator" aria-orientation="horizontal" aria-label="Resize Runs and Triage Hints" tabindex="0" title="Drag to resize · double-click to reset"></div>
+  <section class="wb-panel wb-triage" aria-labelledby="tr-h">
+    <header class="wb-ph"><h2 id="tr-h">Triage Hints</h2><div class="tr-rules" id="tr-rules"></div></header>
+    <div class="wb-pb" id="triage"></div>
+  </section>
+</main>
+<div class="wb-toasts" id="toasts" role="status" aria-live="polite"></div>
+<div class="wb-conn" id="conn" role="alert" hidden>Connection to the fastvol server lost - reconnecting…</div>
+<noscript><p>The fastvol UI needs JavaScript.</p></noscript>
 </body>
 </html>

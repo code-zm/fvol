@@ -10,6 +10,8 @@
 use super::App;
 use super::assets;
 use super::http::{Body, Method, Request, Response};
+use super::picker;
+use super::presets;
 use super::jsonw::W;
 use super::runs::{Run, Status, coltype_name, list_files};
 use super::security;
@@ -86,14 +88,14 @@ pub fn handle(app: &Arc<App>, req: &Request) -> Response {
         // the page itself holds no secret: the token lives in the browser (URL fragment ->
         // localStorage of this exact origin) and goes out in a header on every API call
         (Method::Get | Method::Head, "/") => {
-            let html = assets::INDEX_HTML.replace("{{VERSION}}", crate::VERSION_BANNER);
+            let html = assets::index_html().replace("{{VERSION}}", crate::VERSION_BANNER);
             Response::new(200).header("cache-control", "no-store").bytes("text/html; charset=utf-8", html.into_bytes())
         }
         (Method::Get | Method::Head, "/favicon.svg") | (Method::Get | Method::Head, "/favicon.ico") => {
-            assets::get("favicon.svg").map(|a| assets::respond(a, req)).unwrap_or_else(|| Response::text(404, "not found"))
+            assets::serve("favicon.svg", req)
         }
         (Method::Get | Method::Head, p) if p.starts_with("/assets/") => {
-            assets::get(&p["/assets/".len()..]).map(|a| assets::respond(a, req)).unwrap_or_else(|| Response::text(404, "not found"))
+            assets::serve(&p["/assets/".len()..], req)
         }
         (_, p) if p.starts_with("/api/") => {
             if security::cross_site(req, &host) {
@@ -179,10 +181,75 @@ fn api(app: &Arc<App>, req: &Request, rest: &str) -> Response {
             ok(w)
         }
         (["runs"], _, Method::Post) => create_run(app, req),
+        (["batches"], true, _) => {
+            let mut w = W::new();
+            w.arr();
+            for b in app.runs.batches() {
+                b.json(&mut w);
+            }
+            w.end_arr();
+            ok(w)
+        }
+        (["batches"], _, Method::Post) => create_batch(app, req),
+        (["batches", id, tail @ ..], _, _) => {
+            let Some(b) = id.parse::<u64>().ok().and_then(|i| app.runs.batch(i)) else {
+                return err(404, "no such run");
+            };
+            match (tail, m) {
+                ([], Method::Delete) => {
+                    app.runs.remove_batch(b.id);
+                    err(200, "removed")
+                }
+                (["cancel"], Method::Post) => {
+                    for id in &b.runs {
+                        if let Some(r) = app.runs.get(*id) {
+                            app.runs.cancel(&r);
+                        }
+                    }
+                    err(200, "cancelled")
+                }
+                (["filter"], Method::Post) => {
+                    let j = match body_json(req) {
+                        Ok(j) => j,
+                        Err(r) => return r,
+                    };
+                    match j.get("q").and_then(|q| q.as_str()).filter(|q| q.chars().count() <= 1000) {
+                        Some(q) => {
+                            app.runs.set_batch_filter(&b, q.to_string());
+                            err(200, "saved")
+                        }
+                        None => err(422, "\"q\" is text of at most 1000 characters"),
+                    }
+                }
+                (["name"], Method::Post) => {
+                    let j = match body_json(req) {
+                        Ok(j) => j,
+                        Err(r) => return r,
+                    };
+                    match j.get("name").and_then(|n| n.as_str()).map(str::trim).filter(|n| !n.is_empty() && n.chars().count() <= 80) {
+                        Some(n) => {
+                            app.runs.rename_batch(&b, n.to_string());
+                            let mut w = W::new();
+                            b.json(&mut w);
+                            ok(w)
+                        }
+                        None => err(422, "a run name is 1 to 80 characters"),
+                    }
+                }
+                _ => err(404, "unknown API endpoint"),
+            }
+        }
         (["runs", id, tail @ ..], _, _) => {
             let Some(run) = id.parse::<u64>().ok().and_then(|i| app.runs.get(i)) else {
                 return err(404, "no such run");
             };
+            // a run of a reopened analysis reads its saved rows on first use
+            if !tail.is_empty()
+                && !matches!(tail, ["cancel"] | ["vol"] | ["files", ..] | ["files.zip"])
+                && let Err(e) = app.runs.load_saved(&run)
+            {
+                return err(500, &e);
+            }
             match (tail, m) {
                 ([], Method::Get | Method::Head) => {
                     let mut w = W::new();
@@ -222,6 +289,82 @@ fn api(app: &Arc<App>, req: &Request, rest: &str) -> Response {
         (["mem"], true, _) => mem(app, req),
         (["disasm"], true, _) => disasm(app, req),
         (["fs"], true, _) => fs_list(req),
+        (["pick-file"], true, _) => {
+            let mut w = W::new();
+            let t = picker_tool(app);
+            w.obj().kb("available", t.is_some()).ks("tool", t.map_or("", |t| t.name())).end_obj();
+            ok(w)
+        }
+        (["pick-file"], _, Method::Post) => pick_file(app, req),
+        (["options"], true, _) => {
+            let mut w = W::new();
+            app.options.lock().unwrap_or_else(|e| e.into_inner()).write(&mut w);
+            ok(w)
+        }
+        (["options"], _, Method::Post) => {
+            let j = match body_json(req) {
+                Ok(j) => j,
+                Err(r) => return r,
+            };
+            let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+            let o = match super::options::Options::from_json(&j, &cwd) {
+                Ok(o) => o,
+                Err(e) => return err(422, &e),
+            };
+            match app.set_options(o) {
+                Ok(reopened) => {
+                    let mut w = W::new();
+                    w.obj().kb("reopened", reopened).key("options");
+                    app.options.lock().unwrap_or_else(|e| e.into_inner()).write(&mut w);
+                    w.end_obj();
+                    ok(w)
+                }
+                Err(e) => err(422, &e),
+            }
+        }
+        (["rules"], true, _) => {
+            let mut w = W::new();
+            match &*app.rules.lock().unwrap_or_else(|e| e.into_inner()) {
+                Some((file, text)) => w.obj().ks("file", file).ks("text", text).end_obj(),
+                None => w.null(),
+            };
+            ok(w)
+        }
+        (["rules"], _, Method::Post) => {
+            let j = match body_json(req) {
+                Ok(j) => j,
+                Err(r) => return r,
+            };
+            let (Some(file), Some(text)) = (j.get("file").and_then(|f| f.as_str()), j.get("text").and_then(|t| t.as_str())) else {
+                return err(422, "{\"file\", \"text\"} are required");
+            };
+            if json::parse(text).is_err() {
+                return err(422, "the rules file is not valid JSON");
+            }
+            *app.rules.lock().unwrap_or_else(|e| e.into_inner()) = Some((file.chars().take(200).collect(), text.to_string()));
+            app.hub.bump();
+            err(200, "saved")
+        }
+        (["rules"], _, Method::Delete) => {
+            *app.rules.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            app.hub.bump();
+            err(200, "removed")
+        }
+        (["analyses", id], _, Method::Delete) => match app.delete_analysis(id) {
+            Ok(()) => err(200, "removed"),
+            Err(e) => err(404, &e),
+        },
+        (["analyses"], true, _) => {
+            let mut w = W::new();
+            super::analysis::list(&mut w);
+            ok(w)
+        }
+        (["presets"], true, _) => list_presets(app),
+        (["presets"], _, Method::Post) => save_preset(app, req),
+        (["presets", id], _, Method::Delete) => match presets::delete_in(&presets::presets_dir(), id) {
+            Ok(()) => err(200, "removed"),
+            Err(e) => err(404, &e),
+        },
         _ => err(404, "unknown API endpoint"),
     }
 }
@@ -249,12 +392,19 @@ fn open_session(app: &Arc<App>, req: &Request) -> Response {
     if let Err(e) = std::fs::File::open(&path) {
         return err(422, &format!("{} can't be read: {e}", path.display()));
     }
-    let mut o = app.base_opts.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    o.image = Some(path);
-    if let Some(Json::Arr(dirs)) = j.get("symbol_dirs") {
-        o.symbol_dirs = dirs.iter().filter_map(|d| d.as_str()).map(|d| cwd.join(d).to_string_lossy().into_owned()).collect();
-    }
-    match app.open(o) {
+    let opened = app.open(path).and_then(|s| {
+        // `symbol_dirs` in the request (kept for scripts) is set like the Options dialog's -s
+        match j.get("symbol_dirs") {
+            Some(Json::Arr(dirs)) => {
+                let mut o = app.options.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                o.symbol_dirs = dirs.iter().filter_map(|d| d.as_str()).map(|d| cwd.join(d).to_string_lossy().into_owned()).collect();
+                app.set_options(o)?;
+                Ok(app.session())
+            }
+            _ => Ok(s),
+        }
+    });
+    match opened {
         Ok(s) => {
             let mut w = W::new();
             s.json(&mut w);
@@ -480,7 +630,7 @@ pub fn parse_config(plugin: &dyn Plugin, args: Option<&Json>) -> Result<(Config,
     Ok((cfg, argv))
 }
 
-fn config_key(plugin: &dyn Plugin, cfg: &Config) -> String {
+pub fn config_key(plugin: &dyn Plugin, cfg: &Config) -> String {
     let mut items: Vec<(&String, String)> = cfg.values.iter().map(|(k, v)| (k, format!("{v:?}"))).collect();
     items.sort();
     let mut s = plugin.name().to_string();
@@ -500,7 +650,11 @@ fn create_run(app: &Arc<App>, req: &Request) -> Response {
     };
     let Some(name) = j.get("plugin").and_then(|p| p.as_str()) else { return err(422, "\"plugin\" is required") };
     let Some(plugin) = app.plugins.iter().copied().find(|p| p.name() == name) else { return err(404, &format!("unknown plugin {name}")) };
-    let (cfg, argv) = match parse_config(plugin, j.get("args")) {
+    let args = match app.options.lock().unwrap_or_else(|e| e.into_inner()).run_args(plugin, j.get("args")) {
+        Ok(a) => a,
+        Err(e) => return err(422, &e),
+    };
+    let (cfg, argv) = match parse_config(plugin, Some(&args)) {
         Ok(x) => x,
         Err(e) => return err(422, &e),
     };
@@ -515,6 +669,7 @@ fn create_run(app: &Arc<App>, req: &Request) -> Response {
         Some(r) => (r, true),
         None => {
             let r = app.runs.create(session, plugin, cfg, argv, key, origin);
+            *r.req_args.lock().unwrap_or_else(|e| e.into_inner()) = args;
             app.runs.submit(r.clone());
             (r, false)
         }
@@ -523,6 +678,48 @@ fn create_run(app: &Arc<App>, req: &Request) -> Response {
     w.obj().ku("id", run.id).kb("reused", reused).key("run");
     run.json(&mut w);
     w.end_obj();
+    ok(w)
+}
+
+/// Start a run of several plugins: `{"name": "...", "entries": [{"plugin", "args"}]}`. Every
+/// entry's options are checked first, so a mistake starts nothing.
+fn create_batch(app: &Arc<App>, req: &Request) -> Response {
+    let j = match body_json(req) {
+        Ok(j) => j,
+        Err(r) => return r,
+    };
+    let session = app.session();
+    if session.image.is_none() {
+        return err(409, "open a memory image first");
+    }
+    let entries = match j.get("entries") {
+        Some(Json::Arr(a)) if !a.is_empty() && a.len() <= 200 => a,
+        _ => return err(422, "\"entries\" must list 1 to 200 plugins"),
+    };
+    let mut parsed = Vec::with_capacity(entries.len());
+    for e in entries {
+        let Some(name) = e.get("plugin").and_then(|p| p.as_str()) else { return err(422, "every entry needs a \"plugin\"") };
+        let Some(plugin) = app.plugins.iter().copied().find(|p| p.name() == name) else { return err(404, &format!("unknown plugin {name}")) };
+        let args = match app.options.lock().unwrap_or_else(|e| e.into_inner()).run_args(plugin, e.get("args")) {
+            Ok(a) => a,
+            Err(x) => return err(422, &format!("{name}: {x}")),
+        };
+        match parse_config(plugin, Some(&args)) {
+            Ok((cfg, argv)) => parsed.push((plugin, cfg, argv, args)),
+            Err(x) => return err(422, &format!("{name}: {x}")),
+        }
+    }
+    let n = app.runs.batches().iter().filter(|b| b.session == session.id).count() + 1;
+    let name = j.get("name").and_then(|n| n.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(|s| s.chars().take(80).collect()).unwrap_or_else(|| format!("Run {n}"));
+    let runs = parsed.into_iter().map(|(plugin, cfg, argv, args)| {
+        let key = config_key(plugin, &cfg);
+        let r = app.runs.create(session.clone(), plugin, cfg, argv, key, "user");
+        *r.req_args.lock().unwrap_or_else(|e| e.into_inner()) = args;
+        r
+    }).collect();
+    let b = app.runs.submit_batch(session.id, name, runs);
+    let mut w = W::new();
+    b.json(&mut w);
     ok(w)
 }
 
@@ -997,7 +1194,9 @@ fn md_cell(out: &mut Vec<u8>, s: &[u8]) {
 
 /// Re-run the plugin with a CLI renderer: byte-identical to `fvol -r <renderer> <plugin> ...`.
 fn vol_export(app: &Arc<App>, run: Arc<Run>, req: &Request) -> Response {
-    let renderer = req.param("renderer").unwrap_or("jsonl").to_string();
+    let opts = app.options.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let renderer = req.param("renderer").map(str::to_string).or_else(|| opts.renderer.clone()).unwrap_or_else(|| "quick".into());
+    let ropts = opts.render_options();
     if !crate::renderers::text::RENDERER_NAMES.contains(&renderer.as_str()) {
         return err(422, "unknown renderer");
     }
@@ -1027,7 +1226,7 @@ fn vol_export(app: &Arc<App>, run: Arc<Run>, req: &Request) -> Response {
             } else {
                 run.session.ctx.clone()
             };
-            let mut r = crate::renderers::text::create(&renderer, w, Default::default()).ok_or_else(|| std::io::Error::other("renderer"))?;
+            let mut r = crate::renderers::text::create(&renderer, w, ropts).ok_or_else(|| std::io::Error::other("renderer"))?;
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::context::with_output_dir(&dir, || run.plugin.run(&ctx, &run.cfg, &mut *r))));
             match res {
                 Ok(Ok(())) => r.finish().map_err(|e| std::io::Error::other(e.to_string())),
@@ -1118,6 +1317,77 @@ fn disasm(app: &Arc<App>, req: &Request) -> Response {
     ok(w)
 }
 
+/// The desktop file dialog, when the page's user sits at this machine (loopback only).
+fn picker_tool(app: &App) -> Option<picker::Tool> {
+    if app.hosts.wildcard || !app.hosts.bind.is_some_and(|ip| ip.is_loopback()) {
+        return None;
+    }
+    picker::tool()
+}
+
+/// Show the desktop's "open file" dialog and return the chosen path: `{"dir": "<start>"}`.
+fn pick_file(app: &App, req: &Request) -> Response {
+    let Some(tool) = picker_tool(app) else { return err(501, "no desktop file dialog here (the server needs a display and a loopback address)") };
+    let j = match body_json(req) {
+        Ok(j) => j,
+        Err(r) => return r,
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+    let dir = j.get("dir").and_then(|d| d.as_str()).map(|d| cwd.join(d)).filter(|d| d.is_dir()).unwrap_or(cwd);
+    let mut w = W::new();
+    match picker::pick(tool, &dir) {
+        Ok(picker::Picked::Path(p)) => w.obj().ks("path", &p.to_string_lossy()).end_obj(),
+        Ok(picker::Picked::Cancelled) => w.obj().kb("cancelled", true).end_obj(),
+        Err(e) => return err(409, &e),
+    };
+    ok(w)
+}
+
+/// The user's presets in `~/.fvol/presets` (plus files that could not be read, with the reason).
+fn list_presets(app: &App) -> Response {
+    let known = |n: &str| app.plugins.iter().any(|p| p.name() == n);
+    let dir = presets::presets_dir();
+    let (ok_list, bad) = presets::list_in(&dir, &known);
+    let mut w = W::new();
+    w.obj().ks("dir", &dir.to_string_lossy()).key("presets").arr();
+    for p in &ok_list {
+        presets::write(&mut w, p, true);
+    }
+    w.end_arr().key("errors").arr();
+    for (file, e) in &bad {
+        w.obj().ks("file", file).ks("error", e).end_obj();
+    }
+    w.end_arr().end_obj();
+    ok(w)
+}
+
+/// Save a preset: `{"name", "os", "plugins": [{"plugin", "args"}], "overwrite"}`.
+fn save_preset(app: &App, req: &Request) -> Response {
+    let j = match body_json(req) {
+        Ok(j) => j,
+        Err(r) => return r,
+    };
+    let Some(id) = j.get("name").and_then(|n| n.as_str()).and_then(presets::slug) else {
+        return err(422, "the name needs at least one letter or digit");
+    };
+    let known = |n: &str| app.plugins.iter().any(|p| p.name() == n);
+    let mut p = match presets::from_json(&id, &j, &known) {
+        Ok(p) => p,
+        Err(e) => return err(422, &e),
+    };
+    p.created = presets::now();
+    let overwrite = matches!(j.get("overwrite"), Some(Json::Bool(true)));
+    match presets::save_in(&presets::presets_dir(), &p, overwrite) {
+        Ok(_) => {
+            let mut w = W::new();
+            presets::write(&mut w, &p, true);
+            ok(w)
+        }
+        Err(presets::SaveError::Exists) => err(409, &format!("a preset named \"{}\" already exists", p.name)),
+        Err(presets::SaveError::Io(e)) => err(500, &e),
+    }
+}
+
 /// Directory listing for the "open image" dialog (names, sizes; no contents).
 fn fs_list(req: &Request) -> Response {
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
@@ -1159,6 +1429,7 @@ fn events(app: &Arc<App>) -> Response {
         Box::new(move |w: &mut dyn Write| {
             let _slot = slot;
             let mut last_session: Vec<u8> = Vec::new();
+            let mut last_batches: Vec<u8> = Vec::new();
             let mut sent_seq: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
             let mut seen = 0u64;
             let mut first = true;
@@ -1173,6 +1444,19 @@ fn events(app: &Arc<App>) -> Response {
                     out.extend_from_slice(&sj);
                     out.extend_from_slice(b"}\n");
                     last_session = sj;
+                }
+                let mut bj = W::new();
+                bj.arr();
+                for b in app.runs.batches() {
+                    b.json(&mut bj);
+                }
+                bj.end_arr();
+                let bj = bj.done();
+                if bj != last_batches {
+                    out.extend_from_slice(b"{\"t\":\"batches\",\"batches\":");
+                    out.extend_from_slice(&bj);
+                    out.extend_from_slice(b"}\n");
+                    last_batches = bj;
                 }
                 let runs = app.runs.all();
                 let mut changed = W::new();

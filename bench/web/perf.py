@@ -75,8 +75,8 @@ print(f"windows.handles web {ms(web)}   cli {ms(cli)}")
 
 print("== 42M-row plugin: windows.memmap (no --pid)")
 t = time.perf_counter()
-r = req("POST", "/api/runs", {"plugin": "windows.memmap.Memmap"})
-rid = r["id"]
+big = req("POST", "/api/batches", {"name": "memmap", "entries": [{"plugin": "windows.memmap.Memmap"}]})
+rid = big["runs"][0]
 first = None
 while True:
     s = req("GET", f"/api/runs/{rid}")
@@ -115,22 +115,34 @@ for name, spec in [
 
 print("== browser (headless chromium)")
 from cdp import Chrome  # noqa: E402
+small = req("POST", "/api/batches", {"name": "pslist", "entries": [{"plugin": "windows.pslist.PsList"}]})
+req("GET", f"/api/runs/{small['runs'][0]}/stream")
+TABLE = "document.querySelector('#rs-body .vt')"
+
+
+def open_run(bid):
+    """Open a run's results from the Runs panel and wait for its first rows."""
+    c.eval(f"document.querySelector('.rn-head[data-key=\"b{bid}\"]').click()")
+    c.wait("document.querySelector('#rs-body .vt-row:not(.loading)')", 30)
+    c.pump(0.5)
+
+
 c = Chrome(1440, 900)
 try:
     c.goto(f"http://127.0.0.1:{PORT}/#token={TOKEN}", 1.5)
-    c.wait("document.querySelectorAll('.tnode').length > 0", 30)
+    c.wait("document.querySelector('.qs') || document.querySelector('.wb-panel')", 30)
     nav = c.eval("JSON.stringify(performance.getEntriesByType('navigation').map(e => [e.domContentLoadedEventEnd, e.loadEventEnd]))")
     print(f"app shell: DOMContentLoaded / load at {nav} ms after navigation start (after the login redirect)")
-    c.eval(f"location.hash = 'run/{rid}'")
-    c.wait("document.querySelector('#panes > .pane:not([hidden]) .vt-row:not(.loading)')", 30)
-    c.pump(0.5)
+    c.key("Escape")
+    c.wait("document.querySelector('.rn-head')", 10)
+    open_run(big["id"])
     res = c.eval("""(async () => {
-      const vt = document.querySelector('#panes > .pane:not([hidden]) .vt')._vt;
+      const vt = %s._vt;
       const sc = vt.scroll;
       const costs = [];
       const H = sc.scrollHeight;
       for (let i = 0; i < 120; i++) {
-        sc.scrollTop = (H * ((i * 37) % 120)) / 120;
+        sc.scrollTop = (H * ((i * 37) %% 120)) / 120;
         const t0 = performance.now();
         vt.render();
         document.body.getBoundingClientRect();
@@ -145,29 +157,30 @@ try:
       const warm = performance.now() - t1;
       costs.sort((a, b) => a - b);
       return { median: costs[60], p95: costs[114], max: costs[119], warm, rows: vt.total };
-    })()""")
+    })()""" % TABLE)
     print(f"scroll-jump render over {res['rows']:,} rows (JS + layout per frame): median {res['median']:.2f} ms, p95 {res['p95']:.2f} ms, max {res['max']:.2f} ms")
     res = c.eval("""(async () => {
-      const pane = document.querySelector('#panes > .pane:not([hidden])');
-      const vt = pane.querySelector('.vt')._vt;
-      const q = pane.querySelector('input.q');
+      const vt = %s._vt;
+      const q = document.querySelector('.rs-q');
       const t0 = performance.now();
       q.value = '0x7ff6';
       q.dispatchEvent(new Event('input'));
       while (!(vt.view && vt.rowAt(0))) await new Promise(r => setTimeout(r, 5));
       vt.render();
-      return { ms: performance.now() - t0, rows: vt.total, view: vt.viewMs };
-    })()""")
+      const out = { ms: performance.now() - t0, rows: vt.total, view: vt.viewMs };
+      q.value = '';
+      q.dispatchEvent(new Event('input'));
+      return out;
+    })()""" % TABLE)
     print(f"type a filter -> filtered rows on screen (incl. 180 ms debounce): {res['ms']:.0f} ms ({res['rows']:,} matching rows, server view {res['view']} ms)")
-    c.eval(f"location.hash = 'plugin/windows.pslist.PsList'")
-    c.wait("document.querySelector('#panes > .pane:not([hidden]) .vt-row:not(.loading)')", 30)
+    open_run(small["id"])
     res = c.eval("""(() => {
-      const vt = document.querySelector('#panes > .pane:not([hidden]) .vt')._vt;
+      const vt = %s._vt;
       const costs = [];
       for (let i = 0; i < 50; i++) { const t0 = performance.now(); vt.moveTo(i); void vt.scroll.offsetHeight; costs.push(performance.now() - t0); }
       costs.sort((a, b) => a - b);
       return { median: costs[25], max: costs[49] };
-    })()""")
+    })()""" % TABLE)
     print(f"keyboard row move in a table (render + layout): median {res['median']:.2f} ms, max {res['max']:.2f} ms")
     if c.errors:
         print("JS errors:", c.errors)

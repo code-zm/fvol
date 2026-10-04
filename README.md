@@ -76,13 +76,22 @@ fvol serve -f memory.raw   # prints a local URL with an access token
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/web-ui-overview-dark.png">
-    <img alt="The web UI's overview of a Windows 11 image: evidence details, a process tree with lifelines, suggested first plugins and triage hints." src="docs/assets/screenshots/web-ui-overview-light.png" width="840">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/web-ui-workspace-dark.png">
+    <img alt="The web UI's workspace for a Windows image: the file overview printed line by line, the plugin list with three malware plugins ticked and their options open, two runs with the per-plugin row counts, and triage hints." src="docs/assets/screenshots/web-ui-workspace-light.png" width="840">
   </picture>
 </p>
 
-Plugin palette, million-row tables, process tree, hex viewer, run comparison, exports. Localhost
-only, token-protected. [docs/web-ui.md](docs/web-ui.md)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/web-ui-results-dark.png">
+    <img alt="The results of a Windows Triage run: a tab per plugin with its row count, and the netscan table with its connections and listening sockets." src="docs/assets/screenshots/web-ui-results-light.png" width="840">
+  </picture>
+</p>
+
+Pick plugins or a preset, run them together, and read the results a tab per plugin: million-row
+tables, one filter across all plugins, process trees, exports, every `fvol` option and your own
+triage rules. Everything is saved in `~/.fvol` and comes back when the dump is reopened.
+Localhost only, token-protected. [docs/web-ui.md](docs/web-ui.md)
 
 ## Supported images
 
@@ -159,8 +168,7 @@ originals. [docs/architecture.md](docs/architecture.md#performance-techniques)
 
 ## License
 
-Volatility Software License 1.0, as a port of Volatility 3 ([LICENSE.txt](LICENSE.txt)). The web UI
-embeds JetBrains Mono (SIL OFL 1.1).
+Volatility Software License 1.0, as a port of Volatility 3 ([LICENSE.txt](LICENSE.txt)).
 
 fastvol is built on the work of the Volatility Foundation and the volatility3 contributors. It is
 an independent project, not affiliated with or endorsed by the Volatility Foundation.

@@ -2,7 +2,9 @@
 
   bench/scripts/limit.sh -m 4G python3 bench/web/shots.py [--port 18765] [--name win] [steps...]
 
-Needs a server started with bench/web/serve.sh (token testtoken-NAME-0123456789)."""
+Needs a server started with bench/web/serve.sh (token testtoken-NAME-0123456789). The `readme`
+step writes the README's pictures (docs/assets/screenshots/web-ui-*.png); `--scrub DIR=NEW`
+replaces a local path in the page before each picture, e.g. --scrub /home/me/images=/cases."""
 
 import argparse
 import json
@@ -18,6 +20,7 @@ ap.add_argument("--port", type=int, default=18765)
 ap.add_argument("--name", default="win")
 ap.add_argument("--out", default=os.path.join(DATA, "testdata/scratch/webui/shots"))
 ap.add_argument("--size", default="1440x900")
+ap.add_argument("--scrub", action="append", default=[], metavar="DIR=NEW", help="show NEW instead of DIR in the pictures")
 ap.add_argument("steps", nargs="*")
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
@@ -30,6 +33,7 @@ failed = []
 
 
 def shot(name):
+    c.eval("document.getElementById('toasts').replaceChildren()")
     p = os.path.join(a.out, f"{a.name}-{name}.png")
     c.shot(p)
     print("shot", p)
@@ -45,223 +49,192 @@ def step(name):
 STEPS = []
 
 
-def login(hash_=""):
+def login():
     c.goto(f"{BASE}/?r={time.time()}#token={TOKEN}", 1.0)
-    if hash_:
-        c.eval(f"location.hash = {json.dumps(hash_.lstrip('#'))}")
-    c.wait("document.querySelector('.tab')", 20)
-
-
-def ready():
-    c.wait("document.querySelectorAll('.tnode').length > 0 || document.querySelector('.tree-empty')", 30)
+    c.wait("document.querySelector('.qs') || document.querySelector('.wb-panel')", 20)
     c.pump(0.4)
 
 
-@step("overview")
-def overview():
-    login()
-    ready()
-    c.pump(0.8)
-    shot("01-overview")
-
-
-@step("process")
-def process():
-    # the process with the most children that is still running: usually explorer / services
-    pid = c.eval("import('/assets/core.js').then(m => { const ps = (m.store.procs||[]).filter(p => p.exit === null && p.name); ps.sort((a,b) => b.kids.length - a.kids.length); const e = ps.find(p => /explorer|systemd|launchd|bash|sshd/i.test(p.name)) || ps[0]; return e ? e.pid : null; })")
-    c.eval(f"location.hash = 'proc/{pid}'")
-    c.wait("document.querySelector('.pv-head h2')", 10)
-    c.wait("document.querySelector('.subpanes .vt-row:not(.loading)') || document.querySelector('.subpanes .errcard') || document.querySelector('.subpanes .vt-empty:not([hidden])')", 30)
-    c.pump(1.0)
-    shot("02-process")
-
-
-@step("network")
-def network():
-    pid = c.eval("import('/assets/core.js').then(m => { const p = (m.store.procs||[]).find(p => /svchost|explorer|sshd|systemd-resolve/i.test(p.name) && p.exit === null); return p ? p.pid : 4; })")
-    c.eval(f"location.hash = 'proc/{pid}'")
-    c.wait("document.querySelector('#panes > .pane:not([hidden]) .subtab')", 10)
-    ok = c.eval("(() => { const b = [...document.querySelectorAll('#panes > .pane:not([hidden]) .subtab')].find(b => /Network|Sockets/.test(b.textContent) && !b.disabled); if (b) b.click(); return !!b; })()")
-    if ok:
-        c.wait("document.querySelector('#panes > .pane:not([hidden]) .subpanes > .pane:not([hidden]) .vt-row:not(.loading)') || document.querySelector('#panes > .pane:not([hidden]) .subpanes > .pane:not([hidden]) .vt-empty:not([hidden])')", 60)
-    c.pump(0.8)
-    shot("02b-process-network")
-
-
-@step("palette")
-def palette():
-    c.key("k", mods=2)
-    c.wait("document.querySelector('.palette')", 5)
-    c.type("mal")
-    c.pump(0.4)
-    shot("03-palette")
-    c.key("Tab")
+def workspace():
+    """Past the Quick Start, results closed, nothing ticked."""
+    if c.eval("!!document.querySelector('.qs')"):
+        c.key("Escape")
+    if c.eval("document.body.classList.contains('results-open')"):
+        c.key("Escape")
+    c.eval("document.getElementById('pl-tab-select').click()")
+    c.wait("document.querySelector('.wb-plugins .pl-row')", 20)
     c.pump(0.3)
-    shot("03b-palette-form")
-    c.key("Escape")
-    c.pump(0.2)
+
+
+def theme(t):
+    c.eval(f"localStorage.setItem('fastvol.theme', '{t}'); document.documentElement.setAttribute('data-theme', '{t}')")
+    c.pump(0.3)
+
+
+def scrub():
+    """Local paths (and notifications) out of a picture (the page shows real paths)."""
+    c.eval("document.getElementById('toasts').replaceChildren()")
+    pairs = json.dumps([x.split("=", 1) for x in a.scrub])
+    c.eval(f"""(() => {{ const map = {pairs};
+      const fix = s => {{ for (const [f, t] of map) s = s.split(f).join(t); return s; }};
+      const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let n; while ((n = w.nextNode())) {{ const v = fix(n.nodeValue); if (v !== n.nodeValue) n.nodeValue = v; }}
+      for (const e of document.querySelectorAll('[title]')) e.title = fix(e.title); }})()""")
+
+
+def start_run(name):
+    """Run the built-in triage preset for the image's OS (else the first one); returns its name."""
+    c.eval("document.getElementById('pl-tab-presets').click()")
+    c.wait("document.querySelector('.ps-row')", 10)
+    pick = "([...document.querySelectorAll('.ps-row')].find(r => /Triage/.test(r.textContent)) || document.querySelector('.ps-row'))"
+    preset = c.eval(f"{pick}.querySelector('.ps-name').textContent")
+    c.eval(f"{pick}.click()")
+    c.wait("!document.getElementById('pl-run').hidden", 10)
+    c.eval("document.getElementById('pl-run').click()")
+    c.wait("document.body.classList.contains('results-open')", 20)
+    # every plugin of the run finished
+    c.wait("document.querySelectorAll('.rs-tab').length > 0 && ![...document.querySelectorAll('.rs-tab .rs-dot')].some(d => d.classList.contains('running') || d.classList.contains('queued'))", 300)
+    c.pump(0.6)
+    return preset
+
+
+@step("quickstart")
+def quickstart():
+    login()
+    shot("01-quickstart")
+    c.key("2")
+    c.wait("document.querySelector('.qs-file')", 10)
+    c.pump(0.4)
+    shot("02-quickstart-open")
+    c.key("3")
+    c.pump(0.8)
+    shot("03-quickstart-previous")
+
+
+@step("workspace")
+def workspace_step():
+    login()
+    workspace()
+    shot("04-workspace")
+
+
+@step("select")
+def select():
+    workspace()
+    c.eval("document.getElementById('pl-tab-select').click()")
+    c.eval("(q => { q.value = 'ps'; q.dispatchEvent(new Event('input')); })(document.querySelector('#plugins input[type=search]'))")
+    c.pump(0.3)
+    c.eval("document.querySelectorAll('.pl-row')[0].click()")
+    c.eval("document.querySelectorAll('.pl-row')[1].click()")
+    c.wait("!document.getElementById('pl-run').hidden", 5)
+    c.pump(0.3)
+    shot("05-select")
+    c.eval("(q => { q.value = ''; q.dispatchEvent(new Event('input')); })(document.querySelector('#plugins input[type=search]'))")
+
+
+@step("presets")
+def presets():
+    workspace()
+    c.eval("document.getElementById('pl-tab-presets').click()")
+    c.wait("document.querySelector('.ps-row')", 10)
+    c.pump(0.3)
+    shot("06-presets")
 
 
 @step("results")
 def results():
-    c.eval("import('/assets/core.js').then(m => { location.hash = 'plugin/' + m.store.session.os + '.pslist.PsList'; })")
-    c.wait("document.querySelector('#panes > .pane:not([hidden]) .vt-row:not(.loading)')", 20)
+    workspace()
+    start_run("results")
+    shot("07-results")
+    # a tree (pstree, or the first plugin with nested rows)
+    tree = c.eval("[...document.querySelectorAll('.rs-tab')].findIndex(t => /pstree/.test(t.textContent))")
+    if tree >= 0:
+        c.eval(f"document.querySelectorAll('.rs-tab')[{tree}].click()")
+        c.wait("document.querySelector('.vt-row:not(.loading)')", 20)
+        c.pump(0.6)
+        shot("08-results-tree")
+    c.eval("(q => { q.value = 'svchost'; q.dispatchEvent(new Event('input')); })(document.querySelector('.rs-q'))")
+    c.pump(1.2)
+    shot("09-results-filter")
+    c.eval("(q => { q.value = ''; q.dispatchEvent(new Event('input')); })(document.querySelector('.rs-q'))")
+    c.pump(0.5)
+
+
+@step("options")
+def options():
+    workspace()
+    c.eval("document.getElementById('wb-options').click()")
+    c.wait("document.querySelectorAll('.op-row').length > 10", 10)
     c.pump(0.3)
-    # sort by CreateTime descending via keyboard: focus table, move to column, press s twice
-    c.eval("document.querySelector('#panes > .pane:not([hidden]) .vt').focus()")
-    for _ in range(8):
-        c.key("ArrowRight")
-    c.key("s")
-    c.pump(0.2)
-    c.key("s")
-    c.pump(0.5)
-    c.key("ArrowDown")
-    c.key("ArrowDown")
-    c.key("Enter")
-    c.pump(0.5)
-    shot("04-results-drawer")
-
-
-@step("filescan")
-def filescan():
-    c.eval("location.hash = 'plugin/windows.filescan.FileScan'")
-    c.wait("document.querySelector('#panes > .pane:not([hidden]) .vt-row:not(.loading)')", 60)
-    c.pump(0.5)
-    c.key("/")
-    c.type("\\users\\")
-    c.pump(0.8)
-    c.eval("document.querySelector('#panes > .pane:not([hidden]) .vt').focus()")
-    c.key("f")
-    c.pump(0.3)
-    shot("05-filescan-filter")
-
-
-@step("hex")
-def hexview():
-    off = c.eval("import('/assets/core.js').then(m => { const p = (m.store.procs||[]).find(p => typeof p.offset === 'string'); return p ? p.offset : '0x0'; })")
-    c.eval(f"location.hash = 'hex/kernel/{off}'")
-    c.wait("document.querySelector('#panes > .pane:not([hidden]) .hx-row b')", 10)
-    c.pump(1.0)
-    c.eval("document.querySelector('#panes > .pane:not([hidden]) .hx-grid').focus()")
-    for k in ["ArrowRight"] * 8:
-        c.key(k)
-    c.key("d")
-    c.pump(1.0)
-    shot("06-hex")
-
-
-@step("compare")
-def compare():
-    ids = c.eval("import('/assets/core.js').then(m => [...m.store.runs.values()].filter(r => r.status === 'done').map(r => [r.id, r.plugin]))")
-    by = {p: i for i, p in ids}
-    a_id = by.get("windows.pslist.PsList")
-    run = c.eval("import('/assets/core.js').then(m => m.runPlugin('windows.psscan.PsScan', {}, {reuse: true}).then(r => r.id))")
-    c.eval(f"import('/assets/core.js').then(m => m.whenDone({run}))")
-    c.eval(f"location.hash = 'compare/{a_id}/{run}'")
-    c.wait("document.querySelectorAll('.cmp-side .vt-row:not(.loading)').length > 2", 20)
-    c.pump(0.8)
-    shot("07-compare")
-
-
-@step("timeline")
-def timeline():
-    c.eval("import('/assets/core.js').then(m => { location.hash = 'plugin/' + m.store.session.os + '.pslist.PsList'; })")
-    c.wait("document.querySelector('#panes > .pane:not([hidden]) .vt-row:not(.loading)')", 20)
-    c.eval("[...document.querySelectorAll('#panes > .pane:not([hidden]) .rv-bar button')].find(b => b.textContent === 'Timeline').click()")
-    c.wait("document.querySelector('#panes > .pane:not([hidden]) .hist svg')", 10)
-    c.pump(0.5)
-    shot("08-timeline")
-
-
-@step("timeliner")
-def timeliner():
-    c.eval("location.hash = 'plugin/timeliner.Timeliner'")
-    c.wait("document.querySelector('#panes > .pane:not([hidden]) .hist svg rect')", 120)
-    c.pump(0.8)
-    shot("15-timeliner")
-    # brush the busiest stretch: drag across the middle fifth of the chart
-    # brush around the busiest bar: the burst an analyst would zoom into
-    box = c.eval("""(() => { const svg = document.querySelector('#panes > .pane:not([hidden]) .hist svg'); const r = svg.getBoundingClientRect();
-      let best = null; for (const b of svg.querySelectorAll('rect.b')) { const q = b.getBoundingClientRect(); if (!best || q.height > best.height) best = q; }
-      return [r.left, r.top, r.width, r.height, best.left + best.width / 2]; })()""")
-    y = box[1] + box[3] / 2
-    x0, x1 = max(box[0] + 1, box[4] - 12), box[4] + 12  # may run past the edge: the brush clamps
-    c.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x0, "y": y, "button": "left", "clickCount": 1})
-    for k in range(1, 11):
-        c.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x0 + (x1 - x0) * k / 10, "y": y, "button": "left"})
-    c.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x1, "y": y, "button": "left", "clickCount": 1})
-    c.pump(1.5)
-    c.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": box[0] + box[2] * 0.5, "y": box[1] + box[3] - 4})
-    c.pump(0.5)
-    shot("16-timeliner-range")
+    shot("10-options")
+    c.key("Escape")
 
 
 @step("light")
 def light():
-    c.eval("localStorage.setItem('fastvol.theme', 'light')")
-    login()
-    ready()
-    c.pump(0.8)
-    shot("09-overview-light")
-    pid = c.eval("import('/assets/core.js').then(m => { const ps = (m.store.procs||[]).filter(p => p.exit === null && p.name); ps.sort((a,b) => b.kids.length - a.kids.length); return ps[0] ? ps[0].pid : null; })")
-    c.eval(f"location.hash = 'proc/{pid}'")
-    c.wait("document.querySelector('.subpanes .vt-row:not(.loading)') || document.querySelector('.subpanes .errcard')", 30)
-    c.pump(0.8)
-    shot("10-process-light")
-    c.eval("localStorage.setItem('fastvol.theme', 'dark')")
+    workspace()
+    theme("light")
+    shot("11-workspace-light")
+    theme("dark")
 
 
 @step("laptop")
 def laptop():
-    c.resize(1280, 720)
-    login()
-    ready()
-    c.eval("import('/assets/core.js').then(m => { location.hash = 'plugin/' + m.store.session.os + '.pslist.PsList'; })")
-    c.wait("document.querySelector('#panes > .pane:not([hidden]) .vt-row:not(.loading)')", 20)
-    c.pump(0.6)
-    shot("11-laptop-1280")
-    c.resize(W, H)
-
-
-@step("error")
-def error():
-    other = c.eval("import('/assets/core.js').then(m => m.store.session.os === 'windows' ? 'linux.pslist.PsList' : 'windows.info.Info')")
-    c.eval(f"location.hash = 'plugin/{other}'")
-    c.wait("document.querySelector('#panes > .pane:not([hidden]) .errcard')", 20)
+    workspace()
+    c.resize(1280, 800)
+    c.pump(0.5)
+    shot("12-laptop-1280")
+    c.eval("document.getElementById('wb-ovbtn').click()")
     c.pump(0.4)
-    shot("13-error")
+    shot("13-laptop-overview")
+    c.eval("document.getElementById('wb-ovbtn').click()")
+    c.resize(W, H)
+    c.pump(0.4)
 
 
-@step("nosession")
-def nosession():
-    login()
-    c.wait("document.querySelector('.evcard') || document.querySelector('.openbox')", 10)
-    c.pump(1.0)
-    shot("14-session")
-
-
-@step("openimage")
-def openimage():
-    c.eval("document.getElementById('evidence').click()")
-    c.wait("document.querySelector('.dialog .fslist button')", 10)
-    c.eval("(() => { const i = document.querySelector('.dialog input'); i.value = %s; i.dispatchEvent(new Event('input')); })()"
-           % json.dumps(DATA + "/testdata/images/"))
-    c.pump(1.0)
-    shot("17-open-image")
-    c.key("Escape")
-
-
-@step("help")
-def helpstep():
-    c.key("?")
-    c.pump(0.3)
-    shot("12-help")
-    c.key("Escape")
+@step("readme")
+def readme():
+    """The README's pictures: 1440x780, workspace with plugins ticked and a run open, results."""
+    c.resize(1440, 780)
+    for t in ("dark", "light"):
+        theme(t)
+        c.eval("for (const k of Object.keys(localStorage)) if (k.startsWith('fastvol.cols:') || k === 'fastvol.layout') localStorage.removeItem(k)")
+        login()
+        workspace()
+        if not c.eval("document.querySelector('.rn-head')"):
+            start_run("readme")
+            workspace()
+        head = "document.querySelector('.rn-head')"
+        if not c.eval(f"{head}.parentElement.classList.contains('open')"):
+            c.eval(f"{head}.querySelector('.rn-caret').click()")
+        c.eval("document.getElementById('pl-tab-select').click()")
+        c.eval("(q => { q.value = 'malware'; q.dispatchEvent(new Event('input')); })(document.querySelector('#plugins input[type=search]'))")
+        c.pump(0.3)
+        c.eval("[...document.querySelectorAll('.pl-row')].filter(r => /malfind|hollowprocesses|ldrmodules/.test(r.title)).forEach(r => r.click())")
+        c.eval("document.querySelector('.pl-list').scrollTop = 0; document.activeElement.blur()")
+        c.pump(0.6)
+        scrub()
+        c.shot(os.path.join(a.out, f"web-ui-workspace-{t}.png"))
+        c.eval(f"{head}.click()")
+        c.pump(0.2)
+        if not c.eval("document.body.classList.contains('results-open')"):
+            c.eval(f"{head}.click()")
+        c.wait("document.body.classList.contains('results-open')", 10)
+        # the tab with the most rows makes the fullest table
+        c.eval("(ts => ts.sort((x, y) => (+y.querySelector('.rs-badge').textContent.replace(/,/g, '') || 0) - (+x.querySelector('.rs-badge').textContent.replace(/,/g, '') || 0))[0].click())([...document.querySelectorAll('.rs-tab')])")
+        c.pump(1.5)
+        c.eval("document.activeElement.blur()")
+        scrub()
+        c.shot(os.path.join(a.out, f"web-ui-results-{t}.png"))
+        c.eval("(q => { q.value = ''; q.dispatchEvent(new Event('input')); })(document.querySelector('#plugins input[type=search]'))")
+        c.key("Escape")
+        print("readme pictures", t)
+    theme("dark")
+    c.resize(W, H)
 
 
 try:
     login()
-    ready()
     for name, fn in STEPS:
         if a.steps and name not in a.steps:
             continue

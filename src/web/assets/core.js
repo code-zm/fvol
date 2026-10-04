@@ -19,7 +19,6 @@ export function setToken(t) {
   TOKEN = t;
   try { localStorage.setItem('fastvol.token', t); } catch (e) { /* ignore */ }
 }
-export const VERSION = document.querySelector('meta[name="fastvol-version"]').content;
 
 export class ApiError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -55,13 +54,15 @@ export const store = {
   session: null,
   plugins: [],
   pluginMap: new Map(),
-  runs: new Map(),          // id -> summary
+  runs: new Map(),          // id -> summary of one plugin execution
+  batches: [],              // runs as the user sees them: several plugins started together
   procRun: null,            // run id of the process list
 };
 
-export function sessionRuns() {
+/** The open image's runs (batches), newest first. */
+export function sessionBatches() {
   const sid = store.session && store.session.id;
-  return [...store.runs.values()].filter(r => r.session === sid).sort((a, b) => b.id - a.id);
+  return store.batches.filter(b => b.session === sid).sort((a, b) => b.id - a.id);
 }
 
 export function pluginOs(name) {
@@ -109,7 +110,10 @@ export async function startEvents() {
 }
 
 function handleEvent(ev) {
-  if (ev.t === 'session') {
+  if (ev.t === 'batches') {
+    store.batches = ev.batches;
+    emit('batches', ev.batches);
+  } else if (ev.t === 'session') {
     const prev = store.session;
     store.session = ev.session;
     emit('session', { prev, cur: ev.session });
@@ -257,38 +261,6 @@ export function fmtTime(secs, withDate = true) {
   const iso = new Date(secs * 1000).toISOString();
   return withDate ? iso.slice(0, 19).replace('T', ' ') : iso.slice(11, 19);
 }
-export function fmtSpan(secs) {
-  secs = Math.abs(secs);
-  if (secs < 60) return `${Math.round(secs)}s`;
-  if (secs < 3600) return `${Math.round(secs / 60)}m`;
-  if (secs < 86400) return `${(secs / 3600).toFixed(1)}h`;
-  return `${(secs / 86400).toFixed(1)}d`;
-}
-
-// ------------------------------------------------------------------ python int(x, 0)
-/** Parse like python int(x, 0); returns a BigInt or null. */
-export function int0(s) {
-  if (typeof s === 'number') return Number.isInteger(s) ? BigInt(s) : null;
-  let t = String(s).trim();
-  let neg = false;
-  if (t[0] === '-' || t[0] === '+') { neg = t[0] === '-'; t = t.slice(1); }
-  if (!t) return null;
-  let radix = 10, digits = t, prefixed = false;
-  if (/^0[xob]/i.test(t)) { radix = { x: 16, o: 8, b: 2 }[t[1].toLowerCase()]; digits = t.slice(2); prefixed = true; }
-  if (!digits) return null;
-  // underscores: single, between digits (one allowed right after a base prefix)
-  if (/__/.test(digits) || digits.endsWith('_') || (!prefixed && digits.startsWith('_'))) return null;
-  const clean = digits.replace(/_/g, '');
-  if (!clean) return null;
-  const re = { 2: /^[01]+$/, 8: /^[0-7]+$/, 10: /^[0-9]+$/, 16: /^[0-9a-f]+$/i }[radix];
-  if (!re.test(clean)) return null;
-  // decimal: no leading zeros except zero itself
-  if (radix === 10 && clean.length > 1 && clean[0] === '0' && /[1-9]/.test(clean)) return null;
-  let v = 0n;
-  const R = BigInt(radix);
-  for (const ch of clean.toLowerCase()) v = v * R + BigInt(parseInt(ch, 16));
-  return neg ? -v : v;
-}
 
 // ------------------------------------------------------------------ clipboard & toasts
 export function toast(msg, kind = '') {
@@ -316,14 +288,6 @@ export const prefs = {
   set(k, v) { try { localStorage.setItem('fastvol.' + k, JSON.stringify(v)); } catch (e) { /* quota / blocked */ } },
 };
 
-/** Remember plugin durations to show an ETA next time. */
-export function rememberDuration(plugin, ms) {
-  const d = prefs.get('durations', {});
-  d[plugin] = ms;
-  prefs.set('durations', d);
-}
-export function expectedDuration(plugin) { return prefs.get('durations', {})[plugin]; }
-
 // ------------------------------------------------------------------ menus
 let openMenu = null;
 export function closeMenu() { if (openMenu) { openMenu.remove(); openMenu = null; } }
@@ -350,38 +314,9 @@ export function menu(anchor, items) {
     const i = btns.indexOf(document.activeElement);
     if (e.key === 'ArrowDown') { e.preventDefault(); btns[(i + 1) % btns.length].focus(); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); btns[(i - 1 + btns.length) % btns.length].focus(); }
-    else if (e.key === 'Escape') { e.preventDefault(); closeMenu(); anchor.focus(); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeMenu(); anchor.focus(); }
   });
   return m;
 }
 document.addEventListener('mousedown', e => { if (openMenu && !openMenu.contains(e.target)) closeMenu(); }, true);
 
-/** Modal overlay; returns {root, close}. Esc and scrim clicks close it; focus returns. */
-export function modal(node, { onClose } = {}) {
-  const prevFocus = document.activeElement;
-  const scrim = el('div.scrim');
-  let closed = false;
-  const close = () => {
-    if (closed) return;
-    closed = true;
-    scrim.remove(); node.remove();
-    document.removeEventListener('keydown', key, true);
-    if (onClose) onClose();
-    if (prevFocus && prevFocus.focus) prevFocus.focus();
-  };
-  const key = e => {
-    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
-    if (e.key === 'Tab') { // focus trap
-      const f = [...node.querySelectorAll('button, input, select, textarea, [tabindex="0"], a[href]')].filter(x => !x.disabled && x.offsetParent);
-      if (!f.length) return;
-      if (e.shiftKey && document.activeElement === f[0]) { e.preventDefault(); f[f.length - 1].focus(); }
-      else if (!e.shiftKey && document.activeElement === f[f.length - 1]) { e.preventDefault(); f[0].focus(); }
-    }
-  };
-  scrim.addEventListener('mousedown', close);
-  document.addEventListener('keydown', key, true);
-  node.setAttribute('role', node.getAttribute('role') || 'dialog');
-  node.setAttribute('aria-modal', 'true');
-  document.body.append(scrim, node);
-  return { root: node, close };
-}
